@@ -169,7 +169,7 @@ public:
         auto loopCmd = cmd.command[0];
         auto param = loopCmd->op->main_as_LoopParam();
         // Reset parameters for last command
-        ((flatbuffers::Table*)param)->SetField(LoopParam::VT_LOOPNUMBER, indices->elementSize(), 0);
+        ((flatbuffers::Table*)param)->SetField(LoopParam::VT_LOOPNUMBER, (int)indices->elementSize(), 0);
         auto rgcmd = param->commands()->GetAs<RegionCommand>(0);
         auto step = (int*)rgcmd->steps()->data();
         step[0] = inside;

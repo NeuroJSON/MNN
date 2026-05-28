@@ -287,6 +287,11 @@ ErrorCode ConvolutionPackWinograd::onResize(const std::vector<Tensor *> &inputs,
         parameters[3] = ePack * pack * bytes;
         parameters[4] = 0;
         parameters[5] = 0;
+        // Winograd source-/dest-channel stride. For 3D models after the
+        // Conv3DTurn2D rewrite, per-slab Conv2D inputs reach (batch=D, ic,
+        // H=256, W=192), producing iw*ih*batch*pack ~ 100M. Subsequent
+        // `z * sourceZStep * bytes` overflows int32 around z=6 (= 2.4 GB).
+        // Use size_t for the stride so pointer offsets stay correct.
 
 
         std::vector<size_t> parametersRemain = parameters;
@@ -308,7 +313,7 @@ ErrorCode ConvolutionPackWinograd::onResize(const std::vector<Tensor *> &inputs,
             /*Source Transform Begin*/
 #ifndef MNN_WINO_TRANFORM_TEST_CLOSE
             {
-                int sourceZStep = iw * ih * batch * pack;
+                size_t sourceZStep = (size_t)iw * ih * batch * pack;
                 int oyBegin = xIndex / wUnit;
                 int oxBegin = xIndex % wUnit;
                 int oyEnd = (xIndex + xC-1) / wUnit;
@@ -322,7 +327,7 @@ ErrorCode ConvolutionPackWinograd::onResize(const std::vector<Tensor *> &inputs,
                         int srcY  = hIndex * dstUnit - padY;
                         int ey    = ALIMIN(srcY + srcUnit, ih) - srcY;
                         int sy    = ALIMAX(0, srcY) - srcY;
-                        auto srcStartY = srcOrigin + (srcY * iw + bIndex * iw * ih) * pack * bytes;
+                        auto srcStartY = srcOrigin + ((size_t)srcY * iw + (size_t)bIndex * iw * ih) * pack * bytes;
 
                         for (int si=0; si<step; ++si) {
                             auto wIndex = si + oxBegin;
@@ -373,7 +378,7 @@ ErrorCode ConvolutionPackWinograd::onResize(const std::vector<Tensor *> &inputs,
                         int srcY  = hIndex * dstUnit - padY;
                         int ey    = ALIMIN(srcY + srcUnit, ih) - srcY; //h dim pack element length
                         int sy    = ALIMAX(0, srcY) - srcY;  // first y element
-                        auto srcStartY = srcOrigin + (srcY * iw + bIndex * iw * ih) * pack * bytes;
+                        auto srcStartY = srcOrigin + ((size_t)srcY * iw + (size_t)bIndex * iw * ih) * pack * bytes;
                         for (int si=0; si<step; ++si) {
                             auto wIndex = si + oxBegin;
                             int srcX  = wIndex * dstUnit - padX;
@@ -489,7 +494,11 @@ ErrorCode ConvolutionPackWinograd::onResize(const std::vector<Tensor *> &inputs,
 
                 int srcZStep = (fuseTransformPack ? ePack : xC) * pack;
                 int unitStep = (fuseTransformPack ? ePack : xC) * dc_4 * pack;
-                int dstZStep = ow * oh * pack * batch;
+                // dstZStep = full-volume bytes per output channel-pack.
+                // 100M+ for SIAM full-resolution decoder layers, so the
+                // downstream `z * dstZStep * bytes` overflows int32 unless
+                // we keep dstZStep at 64 bits.
+                size_t dstZStep = (size_t)ow * oh * pack * batch;
                 int oyBegin = xIndex / wUnit;
                 int oxBegin = xIndex % wUnit;
                 int oyEnd = (xIndex + xC-1) / wUnit;

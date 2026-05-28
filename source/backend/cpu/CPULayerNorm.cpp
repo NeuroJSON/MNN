@@ -86,11 +86,15 @@ ErrorCode CPULayerNorm::onExecute(const std::vector<Tensor*> &inputs,
 
     MNN_CONCURRENCY_BEGIN(ttId, threadNumber) {
         for (int tId=ttId; tId < mOutterSize; tId += threadNumber) {
-            const float* inner_input = (const float*)(input + tId * mInnerSize * bytes);
-            float* inner_output = (float*)(output + tId * mInnerSize * bytes);
+            // For 3D-segmentation models (e.g. InstanceNorm rewritten to
+            // LayerNorm over depth*height*width), mInnerSize can reach
+            // ~12.5M and tId * mInnerSize * bytes overflows int32 around
+            // tId=43. Use size_t for the byte offset.
+            const float* inner_input = (const float*)(input + (size_t)tId * mInnerSize * bytes);
+            float* inner_output = (float*)(output + (size_t)tId * mInnerSize * bytes);
             if (bytes != 4) {
-                auto tmpInput = (float*)(mTmpInputFloat.ptr() + ttId * mInnerSize * sizeof(float));
-                auto tmpOutput = (float*)(mTmpOutputFloat.ptr() + ttId * mInnerSize * sizeof(float));
+                auto tmpInput = (float*)(mTmpInputFloat.ptr() + (size_t)ttId * mInnerSize * sizeof(float));
+                auto tmpOutput = (float*)(mTmpOutputFloat.ptr() + (size_t)ttId * mInnerSize * sizeof(float));
                 if (bytes == 1) {
                     CPUCastCreator::cast(inner_input, tmpInput, CPUCastCreator::INT8_TO_FlOAT, mInnerSize, inputQuan->scale, inputQuan->zero, inputQuan->min, inputQuan->max, bn);
                 } else {
@@ -144,8 +148,8 @@ ErrorCode CPULayerNorm::onResize(const std::vector<Tensor*> &inputs,
     auto buf = bn->getBufferAllocator();
 
     if (CPUBackend::getDataType(inputs[0]) == DataType_DT_INT8 || inputs[0]->getType().bytes() == 1 || bn->functions()->bytes != 4) {
-        mTmpInputFloat = buf->alloc(threadNumber * mInnerSize * sizeof(float));
-        mTmpOutputFloat = buf->alloc(threadNumber * mInnerSize * sizeof(float));
+        mTmpInputFloat = buf->alloc((size_t)threadNumber * mInnerSize * sizeof(float));
+        mTmpOutputFloat = buf->alloc((size_t)threadNumber * mInnerSize * sizeof(float));
         buf->free(mTmpInputFloat);
         buf->free(mTmpOutputFloat);
     }

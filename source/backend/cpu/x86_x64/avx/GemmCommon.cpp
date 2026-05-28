@@ -10,6 +10,7 @@
 #include "FunctionSummary.hpp"
 #include "core/Macro.h"
 #include "Vec8.hpp"
+#include <cstdint>
 
 void AVX2GemmPostTreat(float* C, size_t eSize, const size_t* parameter, const float* postParameters,
                        const float* bias) {
@@ -64,7 +65,11 @@ void AVX2GemmPostTreat(float* C, size_t eSize, const size_t* parameter, const fl
 void _AVX_MNNPackC4ForMatMul_A(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el) {
     const int unit = 8;
     int number = info[0];
-    int eReal = info[1];
+    // For Conv3D-decomposed models eReal = iw*ih*batch can reach 12.5M.
+    // Subsequent pointer offsets like `x * unit * eReal` overflow int32
+    // around x=23 / unit=8 / eReal=12.5M (= 2.3B). Promote to int64_t so
+    // the multiplications stay correct.
+    int64_t eReal = info[1];
     int eDest = info[2];
     int offset = info[3];
     int pOffset = unit * offset;
@@ -242,7 +247,7 @@ _mm_storeu_ps(dstX + 24 * i + 5 * 4, r5##i);\
 void _AVX_MNNPackC4ForMatMul_A_EShort(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el) {
     const int unit = 8;
     int number = info[0];
-    int eReal = info[1];
+    int64_t eReal = info[1];   // see _AVX_MNNPackC4ForMatMul_A for rationale
     int eDest = info[2];
     int offset = info[3];
     int pOffset = unit * offset;

@@ -78,7 +78,11 @@ ErrorCode CPUScale::onExecute(const std::vector<Tensor*>& inputs, const std::vec
     MNN_CONCURRENCY_BEGIN(tId, numberThread) {
         for (int i = tId; i < totalDepth; i+=numberThread) {
             auto depthIndex = i / batch;
-            core->MNNScaleAndAddBias((float*)(output->host<uint8_t>() + depthStride * i * core->bytes), (const float*)(input->host<uint8_t>() + depthStride * i * core->bytes), (const float*)(biasPtr + core->pack * core->bytes * depthIndex),
+            // depthStride * i * core->bytes overflows int32 around i=6 on
+            // SIAM-class 3D models (depthStride ~ 100M, bytes=4 → 2.4 GB).
+            // Use size_t for the byte offset so SIMD reads stay in-buffer.
+            size_t byteOffset = (size_t)depthStride * i * core->bytes;
+            core->MNNScaleAndAddBias((float*)(output->host<uint8_t>() + byteOffset), (const float*)(input->host<uint8_t>() + byteOffset), (const float*)(biasPtr + core->pack * core->bytes * depthIndex),
                                      (const float*)(scalePtr + core->pack * core->bytes * depthIndex), planeNumber, 1);
         }
     }

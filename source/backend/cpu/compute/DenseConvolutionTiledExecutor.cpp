@@ -582,7 +582,12 @@ ErrorCode DenseConvolutionTiledImpl::onResize(const std::vector<Tensor*>& inputs
                 ::memset(gemmBuffer, 0, mTempBufferTranspose.stride(0));
             }
             info[0] = 1;
-            int hw4Stride = info[1] * unit * bytes;
+            // hw4Stride = iw * ih * batch * pack * bytes. For SIAM-class 3D
+            // models after Conv3DTurn2D decomposition, info[1] (= iw*ih*batch)
+            // can reach 12.5M, so hw4Stride is ~200 MB and t_ic * hw4Stride
+            // overflows int32 when icC4 >= 11. Use size_t to keep the byte
+            // offset arithmetic correct.
+            size_t hw4Stride = (size_t)info[1] * unit * bytes;
             static_cast<CPUBackend *>(backend())->computeDivideSizes(number * icC4, im2colParallelSize.data() + 1);
             im2colParallelSize[0] = 0;
             MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
@@ -594,8 +599,8 @@ ErrorCode DenseConvolutionTiledImpl::onResize(const std::vector<Tensor*>& inputs
                         int t_ic = tic_inumber % icC4;
                         memcpy(threadEL, el + 4 * inumber, 4 * sizeof(int));
                         threadEL[1] = std::min(ic - (t_ic * unit), unit);
-                        const float* source = (const float*)((const uint8_t*)(srcPtr[inumber]) + t_ic * hw4Stride);
-                        auto gemmDest = gemmBuffer + t_ic * unit * eP * bytes;
+                        const float* source = (const float*)((const uint8_t*)(srcPtr[inumber]) + (size_t)t_ic * hw4Stride);
+                        auto gemmDest = gemmBuffer + (size_t)t_ic * unit * eP * bytes;
                         packA((float *)gemmDest, &source, info, threadEL);
                 }
             }

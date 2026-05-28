@@ -138,7 +138,12 @@ public:
         }
         output->buffer().dimensions = dimSize;
 
-        int totalSizeInput  = 1;
+        // Use 64-bit accumulators: 3D models (e.g. medical-imaging nnUNet)
+        // routinely produce intermediate Reshape inputs with > 2^31 elements
+        // after Conv3D-to-Conv2D decomposition (Convolution3DTurn2D rewrite),
+        // and 32-bit products wrap into the negative range, breaking the
+        // determinAxis arithmetic and the round-trip equality check.
+        int64_t totalSizeInput  = 1;
         for (int i = 0; i < input->buffer().dimensions; ++i) {
             auto l = input->length(i);
             totalSizeInput *= l;
@@ -162,16 +167,16 @@ public:
                 output->buffer().dim[i].extent = reshapeDim;
             }
         }
-        int totalSizeOutput = 1;
+        int64_t totalSizeOutput = 1;
         for (int i = 0; i < dimSize; ++i) {
             totalSizeOutput *= output->buffer().dim[i].extent;
         }
         if (determinAxis >= 0) {
-            output->buffer().dim[determinAxis].extent = totalSizeOutput ? totalSizeInput / totalSizeOutput : 0;
+            output->buffer().dim[determinAxis].extent = (int)(totalSizeOutput ? totalSizeInput / totalSizeOutput : 0);
             totalSizeOutput *= output->buffer().dim[determinAxis].extent;
         }
         if (totalSizeInput != totalSizeOutput) {
-            MNN_PRINT("Reshape error: %d -> %d\n", totalSizeInput, totalSizeOutput);
+            MNN_PRINT("Reshape error: %lld -> %lld\n", (long long)totalSizeInput, (long long)totalSizeOutput);
             return false;
         }
         TensorUtils::getDescribe(output)->dimensionFormat = TensorUtils::getDescribe(input)->dimensionFormat;

@@ -232,9 +232,14 @@ public:
     /**
      * @brief calculate number of elements needed to store data taking reordering flag into account.
      * @return elements needed to store data
+     *
+     * Returns size_t so that tensors with > 2^31 / sizeof(T) elements (common
+     * in 3D medical imaging) don't silently overflow. For 4-byte fp32 the
+     * threshold is ~537M elements, easily reached by a (1, 96, 256, 256, 192)
+     * Im2Col intermediate during Conv3D-to-Conv2D rewrite.
      */
-    inline int elementSize() const {
-        return size() / mBuffer.type.bytes();
+    inline size_t elementSize() const {
+        return usize() / mBuffer.type.bytes();
     }
 
 public:

@@ -153,8 +153,8 @@ ErrorCode CPUTensorConverter::convert(const void* inputRaw, void* outputRaw, MNN
                     return NO_ERROR;
                 }
                 for (int v=start; v<end; ++v) {
-                    auto inputStart = (int8_t*)inputRaw + (v * core->pack * bitLength * area);
-                    auto outputStart = (int8_t*)outputRaw + (v * channel * bitLength * area);
+                    auto inputStart = (int8_t*)inputRaw + ((size_t)v * core->pack * bitLength * area);
+                    auto outputStart = (int8_t*)outputRaw + ((size_t)v * channel * bitLength * area);
                     proc((float*)outputStart, (const float*)inputStart, area, channel, offset);
                 }
             } else {
@@ -225,8 +225,8 @@ ErrorCode CPUTensorConverter::convert(const void* inputRaw, void* outputRaw, MNN
                     return NO_ERROR;
                 }
                 for (int v=start; v<end; ++v) {
-                    auto outputStart = (int8_t*)outputRaw + (v * core->pack * bitLength * area);
-                    auto inputStart = (int8_t*)inputRaw + (v * channel * bitLength * area);
+                    auto outputStart = (int8_t*)outputRaw + ((size_t)v * core->pack * bitLength * area);
+                    auto inputStart = (int8_t*)inputRaw + ((size_t)v * channel * bitLength * area);
                     proc((float*)outputStart, (const float*)inputStart, area, channel, offset);
                 }
             } else {

@@ -242,9 +242,12 @@ ErrorCode CPUDeconvolutionOrigin::onResize(const std::vector<Tensor*>& inputs, c
     mGemmInput = allocator->alloc(threadNumber * im2colOutputStride);
     auto gemmOutputStride = kernelCount * core->pack * eP * core->bytes;
     mGemmOutput = allocator->alloc(threadNumber * gemmOutputStride);
-    auto outputSize = batch*src_width*src_height*ocC4*core->pack*core->bytes;
+    // For ConvTranspose3D-decomposed Deconv2D ops on SIAM-class 3D models
+    // the per-slab outputs reach ~6 GB and outputSize overflows int32 when
+    // computed as plain int. Use size_t.
+    size_t outputSize = (size_t)batch*src_width*src_height*ocC4*core->pack*core->bytes;
     if (threadNumber > 1) {
-        mExtraOutput = allocator->alloc((threadNumber-1)*outputSize);
+        mExtraOutput = allocator->alloc((size_t)(threadNumber-1)*outputSize);
     }
     allocator->free(mGemmInput);
     allocator->free(mGemmOutput);
@@ -300,8 +303,8 @@ ErrorCode CPUDeconvolutionOrigin::onResize(const std::vector<Tensor*>& inputs, c
             }
             // Col2Im
             for (int z = 0; z < ocC4; ++z) {
-                auto dstZ = tempOutPtr + z * src_height * src_width * batch * unitBytes;
-                auto srcZ = colBufferPtr + kw * kh * xCount * z * unitBytes;
+                auto dstZ = tempOutPtr + (size_t)z * src_height * src_width * batch * unitBytes;
+                auto srcZ = colBufferPtr + (size_t)kw * kh * xCount * z * unitBytes;
                 for (int x=0; x<xCount; ++x) {
                     auto indexE = xStart + x;
                     int b = indexE / (width * height);
@@ -317,7 +320,7 @@ ErrorCode CPUDeconvolutionOrigin::onResize(const std::vector<Tensor*>& inputs, c
                     int sfx = ALIMAX(0, (UP_DIV(-srcStartX, dilateX)));
                     int efx = ALIMIN(kw, UP_DIV(src_width - srcStartX, dilateX));
 
-                    auto dstStart = dstZ + b * src_width * src_height * unitBytes + srcStartX * unitBytes + srcStartY * src_width * unitBytes;
+                    auto dstStart = dstZ + (size_t)b * src_width * src_height * unitBytes + srcStartX * unitBytes + (size_t)srcStartY * src_width * unitBytes;
                     auto srcStart = srcZ + x * unitBytes;
                     if (sfy >= efy || sfx >= efx) {
                         continue;
@@ -336,10 +339,10 @@ ErrorCode CPUDeconvolutionOrigin::onResize(const std::vector<Tensor*>& inputs, c
         auto unitBytes = core->pack * core->bytes;
         auto biasPtr = biasTensor->host<uint8_t>();
         for (int z = tId; z < ocC4; z+=threadNumber) {
-            auto dstZ = outputPtr + z * src_height * src_width * batch * unitBytes;
+            auto dstZ = outputPtr + (size_t)z * src_height * src_width * batch * unitBytes;
             if (threadNumber > 1) {
                 for (int index=0; index<threadNumber-1; ++index) {
-                    auto src = mExtraOutput.ptr() + index * outputSize + z * src_height * src_width * batch * unitBytes;
+                    auto src = mExtraOutput.ptr() + (size_t)index * outputSize + (size_t)z * src_height * src_width * batch * unitBytes;
                     core->MNNMatrixAdd((float*)(dstZ), (float*)(src), (float*)(dstZ), src_height * src_width * batch, 0, 0, 0, 1);
                 }
             }

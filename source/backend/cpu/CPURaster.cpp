@@ -9,6 +9,7 @@
 #include "CPURaster.hpp"
 #include "compute/CommonOptFunction.h"
 #include "CPUTensorConvert.hpp"
+#include <algorithm>
 #include "math/Vec.hpp"
 #include "core/Concurrency.h"
 #include "compute/ConvOpt.h"
@@ -137,34 +138,34 @@ void CPURaster::executeFaster(const std::vector<Tensor *> &inputs, const std::ve
             }
             auto& slice = iter.second;
             //Offset use byte
-            auto srcPtr = iter.first->host<uint8_t>() + slice.src.offset * bytes;
-            auto dstPtr = output->host<uint8_t>() + slice.dst.offset * bytes;
+            auto srcPtr = iter.first->host<uint8_t>() + (size_t)slice.src.offset * bytes;
+            auto dstPtr = output->host<uint8_t>() + (size_t)slice.dst.offset * bytes;
             if (slice.src.stride[1] == slice.size[2] && slice.dst.stride[1] == slice.size[2] && slice.src.stride[2] == 1) {
                 for (int z=0; z<slice.size[0]; ++z) {
-                    auto srcZ = srcPtr + z * slice.src.stride[0] * byteC4;
-                    auto dstZ = dstPtr + z * slice.dst.stride[0] * byteC4;
-                    ::memcpy(dstZ, srcZ, slice.size[1] * slice.src.stride[1] * byteC4);
+                    auto srcZ = srcPtr + (size_t)z * slice.src.stride[0] * byteC4;
+                    auto dstZ = dstPtr + (size_t)z * slice.dst.stride[0] * byteC4;
+                    ::memcpy(dstZ, srcZ, (size_t)slice.size[1] * slice.src.stride[1] * byteC4);
                 }
                 continue;
             }
             if (1 == slice.src.stride[2] && 1 == slice.dst.stride[2]) {
                 for (int z=0; z<slice.size[0]; ++z) {
-                    auto srcZ = srcPtr + z * slice.src.stride[0] * byteC4;
-                    auto dstZ = dstPtr + z * slice.dst.stride[0] * byteC4;
+                    auto srcZ = srcPtr + (size_t)z * slice.src.stride[0] * byteC4;
+                    auto dstZ = dstPtr + (size_t)z * slice.dst.stride[0] * byteC4;
                     for (int y=0; y<slice.size[1]; ++y) {
-                        auto srcY = srcZ + y * slice.src.stride[1] * byteC4;
-                        auto dstY = dstZ + y * slice.dst.stride[1] * byteC4;
-                        ::memcpy(dstY, srcY, slice.size[2] * byteC4);
+                        auto srcY = srcZ + (size_t)y * slice.src.stride[1] * byteC4;
+                        auto dstY = dstZ + (size_t)y * slice.dst.stride[1] * byteC4;
+                        ::memcpy(dstY, srcY, (size_t)slice.size[2] * byteC4);
                     }
                 }
                 continue;
             }
             for (int z=0; z<slice.size[0]; ++z) {
-                auto srcZ = srcPtr + z * slice.src.stride[0] * byteC4;
-                auto dstZ = dstPtr + z * slice.dst.stride[0] * byteC4;
+                auto srcZ = srcPtr + (size_t)z * slice.src.stride[0] * byteC4;
+                auto dstZ = dstPtr + (size_t)z * slice.dst.stride[0] * byteC4;
                 for (int y=0; y<slice.size[1]; ++y) {
-                    auto srcY = srcZ + y * slice.src.stride[1] * byteC4;
-                    auto dstY = dstZ + y * slice.dst.stride[1] * byteC4;
+                    auto srcY = srcZ + (size_t)y * slice.src.stride[1] * byteC4;
+                    auto dstY = dstZ + (size_t)y * slice.dst.stride[1] * byteC4;
                     C4proc(dstY, srcY, slice.size[2], slice.src.stride[2], slice.dst.stride[2]);
                 }
             }
@@ -322,6 +323,11 @@ static bool _reduceblit(const Tensor::InsideDescribe::Region& slice, int bytes, 
 }
 
 static void _blit(const Tensor::InsideDescribe::Region& slice, int bytes, const uint8_t* srcPtr, uint8_t* dstPtr, bool hasReduce, FP16ToFP32 funcFp16ToFp32 = nullptr, FP32ToFP16 funcFp32ToFp16 = nullptr) {
+    // 3D models with > 500 MB intermediate tensors produce per-iteration
+    // byte offsets (z * stride[0] * bytes, etc.) that exceed 2^31. Promote
+    // those products to size_t so srcPtr/dstPtr arithmetic stays within
+    // the actual allocation -- otherwise an int32 wrap lands the load in
+    // unmapped memory and the thread segfaults inside memcpy/memmove.
     auto proc = _selectUnitProc(bytes, slice.src.stride[2], slice.dst.stride[2]);
     if (hasReduce) {
         if (_reduceblit(slice, bytes, srcPtr, dstPtr, funcFp16ToFp32, funcFp32ToFp16)) {
@@ -330,12 +336,12 @@ static void _blit(const Tensor::InsideDescribe::Region& slice, int bytes, const 
     }
     if (slice.src.stride[1] == slice.size[2] && slice.dst.stride[1] == slice.size[2] && slice.src.stride[2] == 1) {
         for (int z=0; z<slice.size[0]; ++z) {
-            auto srcZ = srcPtr + z * slice.src.stride[0] * bytes;
-            auto dstZ = dstPtr + z * slice.dst.stride[0] * bytes;
+            auto srcZ = srcPtr + (size_t)z * slice.src.stride[0] * bytes;
+            auto dstZ = dstPtr + (size_t)z * slice.dst.stride[0] * bytes;
 #ifdef DEBUG
-            ::memset(dstZ, 0, slice.size[1] * slice.src.stride[1] * bytes);
+            ::memset(dstZ, 0, (size_t)slice.size[1] * slice.src.stride[1] * bytes);
 #endif
-            ::memcpy(dstZ, srcZ, slice.size[1] * slice.src.stride[1] * bytes);
+            ::memcpy(dstZ, srcZ, (size_t)slice.size[1] * slice.src.stride[1] * bytes);
         }
         return;
     }
@@ -347,25 +353,25 @@ static void _blit(const Tensor::InsideDescribe::Region& slice, int bytes, const 
     }
     if (1 == slice.src.stride[2] && 1 == slice.dst.stride[2]) {
         for (int z=0; z<slice.size[0]; ++z) {
-            auto srcZ = srcPtr + z * slice.src.stride[0] * bytes;
-            auto dstZ = dstPtr + z * slice.dst.stride[0] * bytes;
+            auto srcZ = srcPtr + (size_t)z * slice.src.stride[0] * bytes;
+            auto dstZ = dstPtr + (size_t)z * slice.dst.stride[0] * bytes;
             for (int y=0; y<slice.size[1]; ++y) {
-                auto srcY = srcZ + y * slice.src.stride[1] * bytes;
-                auto dstY = dstZ + y * slice.dst.stride[1] * bytes;
+                auto srcY = srcZ + (size_t)y * slice.src.stride[1] * bytes;
+                auto dstY = dstZ + (size_t)y * slice.dst.stride[1] * bytes;
 #ifdef DEBUG
-                ::memset(dstY, 0, slice.size[2] * bytes);
+                ::memset(dstY, 0, (size_t)slice.size[2] * bytes);
 #endif
-                ::memcpy(dstY, srcY, slice.size[2] * bytes);
+                ::memcpy(dstY, srcY, (size_t)slice.size[2] * bytes);
             }
         }
         return;
     }
     for (int z=0; z<slice.size[0]; ++z) {
-        auto srcZ = srcPtr + z * slice.src.stride[0] * bytes;
-        auto dstZ = dstPtr + z * slice.dst.stride[0] * bytes;
+        auto srcZ = srcPtr + (size_t)z * slice.src.stride[0] * bytes;
+        auto dstZ = dstPtr + (size_t)z * slice.dst.stride[0] * bytes;
         for (int y=0; y<slice.size[1]; ++y) {
-            auto srcY = srcZ + y * slice.src.stride[1] * bytes;
-            auto dstY = dstZ + y * slice.dst.stride[1] * bytes;
+            auto srcY = srcZ + (size_t)y * slice.src.stride[1] * bytes;
+            auto dstY = dstZ + (size_t)y * slice.dst.stride[1] * bytes;
             proc(dstY, srcY, slice.size[2], slice.src.stride[2], slice.dst.stride[2]);
         }
     }
@@ -619,6 +625,31 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
     for (auto& iter : mTempInput) {
         tensorConvert(iter.first, iter.second, (int)bytes);
     }
+    // For 3D models with very large intermediate tensors (SIAM-class,
+    // > ~2 GB per tensor after Conv3DTurn2D rewrite), multi-threaded
+    // Raster execution races or OOBs in ways the single-thread path
+    // does not. Detect this case via any region's stride and demote to
+    // single-thread for this op. This is a workaround until the root
+    // cause is found.
+    // Multi-thread Raster on 3D-segmentation models (e.g. SIAM v0.3 with
+    // > 2 GB intermediate tensors after Conv3DTurn2D) segfaults inside
+    // _blit's inner memcpy even when the per-thread offset arithmetic
+    // is provably non-overlapping. The root cause is not yet identified;
+    // single-thread runs correctly. As a workaround, force single-thread
+    // for any Raster op touching tensors that approach the int32 byte
+    // boundary in any stride direction.
+    for (auto& iter : mTempInputCopy) {
+        auto& slice = *(iter.second);
+        for (int v = 0; v < 3; ++v) {
+            int64_t s = (int64_t)std::max(slice.src.stride[v], slice.dst.stride[v]) * (int64_t)bytes;
+            if (s > (int64_t)16 * 1024 * 1024) {
+                mUseThreads = false;
+                break;
+            }
+        }
+        if (!mUseThreads) break;
+    }
+
     do {
         if (mTempInputCopy.size() == 1 && threadNumber > 1 && (!mHasReduce)) {
             // Split to multi region
@@ -679,7 +710,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
     if (!mUseThreads) {
         threadNum = 1;
     }
-    
+
     // StrideSliceWrite should not use multi threads
     auto outputDescribe = TensorUtils::getDescribe(output);
     if (outputDescribe->overlap) {
@@ -699,8 +730,8 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
                 // Avoid crash when has zero shape input blit
                 continue;
             }
-            auto srcPtr = iter.first->host<uint8_t>() + slice.src.offset * bytes;
-            auto dstPtr = (uint8_t*)mOutputPtr + slice.dst.offset * bytes;
+            auto srcPtr = iter.first->host<uint8_t>() + (size_t)slice.src.offset * bytes;
+            auto dstPtr = (uint8_t*)mOutputPtr + (size_t)slice.dst.offset * bytes;
             _blit(slice, (int)bytes, srcPtr, dstPtr, mHasReduce, core->MNNLowpToFp32, core->MNNFp32ToLowp);
         }
     }, threadNum));
@@ -952,9 +983,9 @@ public:
                     auto dstOffset = dstIter * step0 + dstView->offset();
                     if (dstOffset >= 0 && dstOffset < outputSize) {
                         if (srcOffset >= 0 && srcOffset < inputSize) {
-                            _blit(reg, bytes, input->host<uint8_t>() + bytes * srcOffset, output->host<uint8_t>() + bytes * dstOffset, false);
+                            _blit(reg, bytes, input->host<uint8_t>() + (size_t)bytes * srcOffset, output->host<uint8_t>() + (size_t)bytes * dstOffset, false);
                         } else {
-                            _zero(reg, bytes, output->host<uint8_t>() + bytes * dstOffset);
+                            _zero(reg, bytes, output->host<uint8_t>() + (size_t)bytes * dstOffset);
                         }
                     }
                 }

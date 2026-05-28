@@ -15,7 +15,8 @@ public:
     virtual bool onCompute(const Op* op, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                            Context& context, CommandBuffer& res) const override {
         auto input = inputs[0], output = outputs[0];
-        auto batch = output->elementSize(), M = input->length(input->dimensions() - 1);
+        int batch = (int)output->elementSize();
+        int M = input->length(input->dimensions() - 1);
         
         auto midInput = std::shared_ptr<Tensor>(Tensor::createDevice({batch, M, M}, input->getType(), input->getDimensionType()));
         auto midInDes = TensorUtils::getDescribe(midInput.get());
