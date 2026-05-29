@@ -12,6 +12,7 @@
 #include "core/BufferAllocator.hpp"
 #include "core/TensorUtils.hpp"
 #include "shape/SizeComputer.hpp"
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -450,6 +451,14 @@ Backend::MemObj* OpenCLBackend::onAcquire(const Tensor* nativeTensor, StorageTyp
     int W = tensorShape.at(2);
     int C = tensorShape.at(3);
 
+    /* PHASE 1 VRAM TRACKING: print every BUFFER-pool allocation. Hidden
+     * unless MNN_VRAM_TRACK=1 in env to avoid 100K+ lines of noise. */
+    static int s_vram_track = -1;
+    if (s_vram_track < 0) {
+        const char* e = std::getenv("MNN_VRAM_TRACK");
+        s_vram_track = (e && e[0] == '1') ? 1 : 0;
+    }
+
     #ifdef LOG_VERBOSE
     MNN_PRINT("OpenCLBackend::onAcquireBuffer: NHWC:[%d, %d, %d, %d]\n", N, H, W, C);
     #endif
@@ -480,6 +489,25 @@ Backend::MemObj* OpenCLBackend::onAcquire(const Tensor* nativeTensor, StorageTyp
         #endif
         // Align when int4 memory
         size = ROUND_UP(size, 2);
+
+        if (s_vram_track) {
+            const char* storage_name = (storageType == DYNAMIC_SEPERATE) ? "DYN_SEP"
+                                     : (storageType == DYNAMIC) ? "DYN"
+                                     : (storageType == DYNAMIC_IN_EXECUTION) ? "DYN_EXEC"
+                                     : (storageType == STATIC) ? "STATIC" : "?";
+            auto usage = TensorUtils::getDescribe(nativeTensor)->usage;
+            auto memType = TensorUtils::getDescribe(nativeTensor)->memoryType;
+            auto fmt = TensorUtils::getDescribe(nativeTensor)->dimensionFormat;
+            const int dims = nativeTensor->dimensions();
+            const size_t bytes = (size_t)(size * typeSize);
+            fprintf(stderr, "[VRAM] alloc %10zu B  %-8s usage=%d memType=%d fmt=%d dim=%d shape=(",
+                    bytes, storage_name, (int)usage, (int)memType, (int)fmt, dims);
+            for (int i = 0; i < dims; ++i) {
+                fprintf(stderr, "%d%s", nativeTensor->length(i), i+1 < dims ? "," : "");
+            }
+            fprintf(stderr, ")\n");
+        }
+
         if (storageType == DYNAMIC_SEPERATE) {
             auto buffer = mBufferPool->alloc(size*typeSize, true);
             ((Tensor*)nativeTensor)->buffer().device = (uint64_t)buffer;

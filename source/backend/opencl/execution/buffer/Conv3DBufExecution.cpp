@@ -221,7 +221,9 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
 
     /* Choose between the NC4HW4-reader kernel and the NCHW-reader
      * kernel based on input layout. Per-encode decision because each
-     * Conv3D op may have a different upstream producer. */
+     * Conv3D op may have a different upstream producer. Currently only
+     * the NCHW path reads origin directly (saves one Raster); the
+     * NC4HW4 path reads MNN's materialized buffer like the original. */
     auto in_d = TensorUtils::getDescribe(in);
     Tensor* read_from = in;
     bool use_nchw_kernel = false;
