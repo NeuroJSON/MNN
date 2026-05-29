@@ -81,6 +81,27 @@ ErrorCode MatMulBufExecution::onEncode(const std::vector<Tensor *> &inputs, cons
             param = getGemmParams({(uint32_t)M, (uint32_t)N, (uint32_t)K, layout, batch, (uint32_t)1}, {openCLBuffer(input0), openCLBuffer(input1), openCLBuffer(output), openCLBuffer(inputs[2])}, mOpenCLBackend->getOpenCLRuntime(), mOpenCLBackend->getPrecision(), mOpenCLBackend->getCLTuneLevel());
         }
         int KWG=param[0], KWI=param[1], MDIMA=param[2], MDIMC=param[3], MWG=param[4], NDIMB=param[5], NDIMC=param[6], NWG=param[7], SA=param[8], SB=param[9], STRM=param[10], STRN=param[11], VWM=param[12], VWN=param[13];
+
+        /* matmul_params_buf.cl's Xgemm kernel is compiled with
+         *   __attribute__((reqd_work_group_size(MDIMC, NDIMC, 1)))
+         * (see matmul_params_buf.cl :1336 and :1398), so the launch LWS
+         * MUST equal (MDIMC, NDIMC, 1) or the driver throws
+         * CL_INVALID_WORK_GROUP_SIZE (-54). Previously this path hardcoded
+         * launch LWS = (localM=32, localN=8) which only happened to match
+         * the kernel's reqd size when getGemmParams's auto-tuner returned
+         * MDIMC=32, NDIMC=8 -- on NVIDIA Titan V (and any other path
+         * where the tuner returns different params, e.g. MDIMC=16 for
+         * M%64==0 && M%128!=0 shapes like SIAM's decoder MatMul
+         * (1152, 256, 8640)), the launch failed with -54 and the output
+         * tensor was left at its alloc-time value (zeros). Fix:
+         * propagate MDIMC/NDIMC/MWG/NWG back into the per-launch
+         * tile/local sizes so GWS and LWS stay consistent with whatever
+         * the tuner picked. */
+        localM = static_cast<unsigned int>(MDIMC);
+        localN = static_cast<unsigned int>(NDIMC);
+        tileM  = static_cast<unsigned int>(MWG);
+        tileN  = static_cast<unsigned int>(NWG);
+
         buildOptions.emplace("-DKWG=" + std::to_string(KWG));
         buildOptions.emplace("-DKWI=" + std::to_string(KWI));
         buildOptions.emplace("-DMDIMA=" + std::to_string(MDIMA));
