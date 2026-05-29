@@ -177,14 +177,24 @@ Conv3DBufExecution::Conv3DBufExecution(const std::vector<Tensor*>& inputs,
         MNN_CHECK_CL_SUCCESS(err, "write Conv3D bias buffer");
     }
 
-    /* ----- Build the OpenCL kernel ------------------------------------- */
+    /* Build BOTH kernel variants at ctor; per-encode we pick which to
+     * launch based on whether the input layout is NC4HW4 (default) or
+     * NCHW (when reading directly from a MEMORY_VIRTUAL Region's
+     * NCHW-formatted source tensor). */
     std::set<std::string> buildOptions;
-    unit.kernel = runtime->buildKernel("conv_3d_buf",
-                                       "conv_3d_buf_nc4dhw4",
-                                       buildOptions,
-                                       mOpenCLBackend->getPrecision());
-    OPENCL_CHECK_KERNEL_CTOR(unit.kernel);
-    mMaxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(unit.kernel));
+    mKernelNC4 = runtime->buildKernel("conv_3d_buf", "conv_3d_buf_nc4dhw4",
+                                      buildOptions, mOpenCLBackend->getPrecision());
+    OPENCL_CHECK_KERNEL_CTOR(mKernelNC4);
+    mMaxWGS_NC4 = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernelNC4));
+
+    mKernelNCHW = runtime->buildKernel("conv_3d_buf", "conv_3d_buf_nchw_in",
+                                       buildOptions, mOpenCLBackend->getPrecision());
+    OPENCL_CHECK_KERNEL_CTOR(mKernelNCHW);
+    mMaxWGS_NCHW = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernelNCHW));
+
+    /* unit.kernel will be assigned per-encode. */
+    unit.kernel = mKernelNC4;  /* default; onEncode may swap */
+    mMaxWorkGroupSize = mMaxWGS_NC4;
 }
 
 ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
@@ -209,16 +219,49 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
     mGWS[1] = static_cast<uint32_t>(Dout * Hout);
     mGWS[2] = static_cast<uint32_t>(Coutblk);
 
+    /* Choose between the NC4HW4-reader kernel and the NCHW-reader
+     * kernel based on input layout. Per-encode decision because each
+     * Conv3D op may have a different upstream producer. */
+    auto in_d = TensorUtils::getDescribe(in);
+    Tensor* read_from = in;
+    bool use_nchw_kernel = false;
+    if (in_d->memoryType == Tensor::InsideDescribe::MEMORY_VIRTUAL
+        && !in_d->regions.empty()) {
+        const auto& r = in_d->regions[0];
+        bool identity = (r.src.offset == 0 && r.dst.offset == 0
+                         && r.src.stride[0] == r.dst.stride[0]
+                         && r.src.stride[1] == r.dst.stride[1]
+                         && r.src.stride[2] == r.dst.stride[2]);
+        if (identity && r.origin && r.origin->deviceId() != 0) {
+            auto orig_d = TensorUtils::getDescribe(r.origin);
+            if (orig_d->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
+                read_from = r.origin;
+                use_nchw_kernel = true;
+            }
+        }
+    }
+
+    if (use_nchw_kernel) {
+        unit.kernel = mKernelNCHW;
+        mMaxWorkGroupSize = mMaxWGS_NCHW;
+    } else {
+        unit.kernel = mKernelNC4;
+        mMaxWorkGroupSize = mMaxWGS_NC4;
+    }
+
     uint32_t idx = 0;
     cl_int ret = CL_SUCCESS;
     ret |= unit.kernel->get().setArg(idx++, mGWS[0]);
     ret |= unit.kernel->get().setArg(idx++, mGWS[1]);
     ret |= unit.kernel->get().setArg(idx++, mGWS[2]);
-    ret |= unit.kernel->get().setArg(idx++, openCLBuffer(in));
+    ret |= unit.kernel->get().setArg(idx++, openCLBuffer(read_from));
     ret |= unit.kernel->get().setArg(idx++, *mKernelBuffer);
     ret |= unit.kernel->get().setArg(idx++, *mBiasBuffer);
     ret |= unit.kernel->get().setArg(idx++, openCLBuffer(out));
-    ret |= unit.kernel->get().setArg(idx++, static_cast<int>(Cinblk));
+    /* NC4HW4 kernel expects in_cblock; NCHW kernel expects raw Cin. */
+    ret |= unit.kernel->get().setArg(idx++, use_nchw_kernel
+                                            ? static_cast<int>(Cin)
+                                            : static_cast<int>(Cinblk));
     ret |= unit.kernel->get().setArg(idx++, static_cast<int>(Din));
     ret |= unit.kernel->get().setArg(idx++, static_cast<int>(Hin));
     ret |= unit.kernel->get().setArg(idx++, static_cast<int>(Win));
@@ -237,7 +280,9 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
     MNN_CHECK_CL_SUCCESS(ret, "setArg Conv3DBufExecution");
 
     mLWS = localWS3DDefault(mGWS, mMaxWorkGroupSize, runtime,
-                            "conv_3d_buf_nc4dhw4", unit.kernel,
+                            use_nchw_kernel ? "conv_3d_buf_nchw_in"
+                                            : "conv_3d_buf_nc4dhw4",
+                            unit.kernel,
                             mOpenCLBackend->getCLTuneLevel(),
                             "conv_3d_buf").first;
 

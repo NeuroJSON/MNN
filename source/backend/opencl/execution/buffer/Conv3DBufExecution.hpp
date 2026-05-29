@@ -62,6 +62,14 @@ private:
     std::shared_ptr<cl::Buffer> mKernelBuffer;
     std::shared_ptr<cl::Buffer> mBiasBuffer;
 
+    // Two kernel variants: NC4HW4 reader for standard inputs, NCHW
+    // reader for inputs we can take directly from a MEMORY_VIRTUAL
+    // Region's NCHW source. Picked per-encode based on input layout.
+    std::shared_ptr<KernelWrap> mKernelNC4 = nullptr;
+    std::shared_ptr<KernelWrap> mKernelNCHW = nullptr;
+    uint32_t mMaxWGS_NC4  = 1;
+    uint32_t mMaxWGS_NCHW = 1;
+
     // Per-launch global / local work sizes resolved in onEncode().
     std::vector<uint32_t> mGWS{1, 1, 1};
     std::vector<uint32_t> mLWS{1, 1, 1};
