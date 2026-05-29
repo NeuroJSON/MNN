@@ -10,6 +10,7 @@
 #include "geometry/GeometryComputer.hpp"
 #include "core/OpCommonUtils.hpp"
 #include "geometry/GeometryComputerUtils.hpp"
+#include <cstdlib>  // for std::getenv -- SIAM_DISABLE_GEOM_CONV3D opt-out
 
 namespace MNN {
 #ifdef MNN_SUPPORT_DEPRECATED_OPV2
@@ -291,8 +292,24 @@ public:
 #endif
 static void _create() {
 #ifdef MNN_SUPPORT_DEPRECATED_OPV2
-    std::shared_ptr<GeometryComputer> comp(new GeometryConv3D);
-    GeometryComputer::registerGeometryComputer(comp, {OpType_Convolution3D});
+    /* Allow selective disable of the GeometryConv3D decomposition
+     * so a backend that registers a native Conv3D op-creator can take
+     * over (siamize's OpenCL Conv3DBufExecution lives in
+     * source/backend/opencl/execution/buffer/Conv3DBufExecution.cpp).
+     * Default behavior is unchanged: both Conv3D and ConvTranspose3D
+     * get decomposed into 2D primitives.
+     *
+     * Set env var SIAM_DISABLE_GEOM_CONV3D=1 to skip GeometryConv3D
+     * registration while keeping GeometryConvTranspose3D so existing
+     * 3D-deconv inference still works through the legacy 2D path
+     * (until we add a native Deconv3D too). */
+    const char* skip_env = std::getenv("SIAM_DISABLE_GEOM_CONV3D");
+    const bool skip_conv3d = (skip_env != nullptr && skip_env[0] == '1');
+
+    if (!skip_conv3d) {
+        std::shared_ptr<GeometryComputer> comp(new GeometryConv3D);
+        GeometryComputer::registerGeometryComputer(comp, {OpType_Convolution3D});
+    }
 
     std::shared_ptr<GeometryComputer> comp2(new GeometryConvTranspose3D);
     GeometryComputer::registerGeometryComputer(comp2, {OpType_ConvTranspose3D});

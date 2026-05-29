@@ -195,50 +195,6 @@ Conv3DBufExecution::Conv3DBufExecution(const std::vector<Tensor*>& inputs,
                                        mOpenCLBackend->getPrecision());
     OPENCL_CHECK_KERNEL_CTOR(unit.kernel);
     mMaxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(unit.kernel));
-
-    /* Claim the input/output tensors on the OpenCL backend if MNN's
-     * pipeline-side input wrapping (Pipeline::_resizeCommand's
-     * inputTensorCopyCache branch) hasn't already done so. The wrap
-     * branch fires only when the input tensor's "consumer" graph
-     * requires a layout/backend transition; when our backend-native
-     * Conv3D is the *only* consumer chain (no GeometryComputer
-     * decomposing into intermediate ops), the pipeline can decide
-     * no wrap is needed and the session-input tensor reaches
-     * runSession with backend == nullptr. MnnEngine's manual
-     * copyFromHostTensor then returns false because the backend
-     * isn't bound.
-     *
-     * We claim with STATIC lifetime for the session-input case
-     * (the tensor lives across multiple run_tile calls) and let
-     * the framework refcount any other tensors that arrive
-     * already-bound. The onAcquireBuffer is idempotent: if the
-     * tensor already has a backend (i.e. the normal mid-graph
-     * case) it's a cheap no-op refcount bump. */
-    for (auto* t : inputs) {
-        auto* d = TensorUtils::getDescribeOrigin(t);
-
-        if (d->getBackend() == nullptr) {
-            if (!mOpenCLBackend->onAcquireBuffer(t, Backend::STATIC)) {
-                fprintf(stderr,
-                        "[Conv3DBuf ctor] onAcquireBuffer(input) failed\n");
-                mValid = false;
-                return;
-            }
-        }
-    }
-
-    for (auto* t : outputs) {
-        auto* d = TensorUtils::getDescribeOrigin(t);
-
-        if (d->getBackend() == nullptr) {
-            if (!mOpenCLBackend->onAcquireBuffer(t, Backend::STATIC)) {
-                fprintf(stderr,
-                        "[Conv3DBuf ctor] onAcquireBuffer(output) failed\n");
-                mValid = false;
-                return;
-            }
-        }
-    }
 }
 
 ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
