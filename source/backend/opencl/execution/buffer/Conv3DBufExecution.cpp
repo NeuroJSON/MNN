@@ -96,33 +96,24 @@ Conv3DBufExecution::Conv3DBufExecution(const std::vector<Tensor*>& inputs,
                                 ? sizeof(uint16_t)
                                 : sizeof(float);
 
-    mKernelBuffer.reset(new cl::Buffer(
-        runtime->context(), CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
-        packed_count * fbytes));
+    /* Allocate device-side weight buffer (no CL_MEM_ALLOC_HOST_PTR;
+     * NVIDIA's OpenCL appears to mishandle host-mapped CL_MEM_READ_ONLY
+     * buffers for kernels with non-trivial inner-loop access patterns
+     * -- the working ConvBufExecution.cpp pattern is to allocate via
+     * the MNN buffer pool with STATIC lifetime, then use a TEMP host
+     * mapped buffer for the host->device copy. We follow the same
+     * pattern: build the packed layout in a host-side vector, then
+     * enqueueWriteBuffer it into a plain device buffer.) */
+    std::vector<uint8_t> host_packed(packed_count * fbytes, 0);
 
     {
-        cl_int err = CL_SUCCESS;
-        void* mapped = runtime->commandQueue().enqueueMapBuffer(
-                           *mKernelBuffer, CL_TRUE, CL_MAP_WRITE,
-                           0, packed_count * fbytes, nullptr, nullptr, &err);
-        MNN_CHECK_CL_SUCCESS(err, "map Conv3D weight buffer");
-
-        /* Zero the buffer first so the padding lanes are clean. */
-        if (mOpenCLBackend->getPrecision() == BackendConfig::Precision_Low) {
-            ::memset(mapped, 0, packed_count * sizeof(uint16_t));
-        } else {
-            ::memset(mapped, 0, packed_count * sizeof(float));
-        }
-
         const int Kvol = Kd * Kh * Kw;
 
-        /* Repack one weight element at a time. */
         for (int oc = 0; oc < Cout; ++oc) {
             for (int ic = 0; ic < Cin; ++ic) {
                 for (int kdi = 0; kdi < Kd; ++kdi) {
                     for (int khi = 0; khi < Kh; ++khi) {
                         for (int kwi = 0; kwi < Kw; ++kwi) {
-                            /* Source: [oc, ic, kd, kh, kw] flat (ONNX layout) */
                             const int src_idx =
                                 ((oc * Cin + ic) * Kd + kdi) * Kh * Kw +
                                 khi * Kw + kwi;
@@ -132,8 +123,6 @@ Conv3DBufExecution::Conv3DBufExecution(const std::vector<Tensor*>& inputs,
                             const int ic_blk    = ic / 4;
                             const int ic_inner  = ic % 4;
 
-                            /* Destination: [oc_blk, kd, kh, kw, ic_blk, 4_cin, 4_cout]
-                             * inner = ic_inner * 4 + oc_inner   (16 floats per tile) */
                             const int dst_idx =
                                 ((((oc_blk * Kvol)
                                    + (kdi * Kh + khi) * Kw + kwi) * Cin_blk
@@ -143,48 +132,49 @@ Conv3DBufExecution::Conv3DBufExecution(const std::vector<Tensor*>& inputs,
                             const float v = w_host[src_idx];
 
                             if (mOpenCLBackend->getPrecision() == BackendConfig::Precision_Low) {
-                                reinterpret_cast<uint16_t*>(mapped)[dst_idx] = float_to_half(v);
+                                reinterpret_cast<uint16_t*>(host_packed.data())[dst_idx] = float_to_half(v);
                             } else {
-                                reinterpret_cast<float*>(mapped)[dst_idx] = v;
+                                reinterpret_cast<float*>(host_packed.data())[dst_idx] = v;
                             }
                         }
                     }
                 }
             }
         }
-
-        runtime->commandQueue().enqueueUnmapMemObject(*mKernelBuffer, mapped);
     }
 
-    /* ----- Bias buffer: [Cout_blk * 4] floats, zero-padded -------------- */
+    mKernelBuffer.reset(new cl::Buffer(
+        runtime->context(), CL_MEM_READ_WRITE,
+        packed_count * fbytes));
+    {
+        cl_int err = runtime->commandQueue().enqueueWriteBuffer(
+            *mKernelBuffer, CL_TRUE, 0, packed_count * fbytes, host_packed.data());
+        MNN_CHECK_CL_SUCCESS(err, "write Conv3D weight buffer");
+    }
+
+    /* ----- Bias buffer (same device-only-no-ALLOC_HOST_PTR pattern). */
     const size_t bias_count = static_cast<size_t>(Cout_blk) * 4;
+    std::vector<uint8_t> host_bias(bias_count * fbytes, 0);
+
+    if (mOpenCLBackend->getPrecision() == BackendConfig::Precision_Low) {
+        auto* dst = reinterpret_cast<uint16_t*>(host_bias.data());
+        for (int c = 0; c < Cout; ++c) {
+            dst[c] = float_to_half(b_host ? b_host[c] : 0.0f);
+        }
+    } else {
+        auto* dst = reinterpret_cast<float*>(host_bias.data());
+        for (int c = 0; c < Cout; ++c) {
+            dst[c] = b_host ? b_host[c] : 0.0f;
+        }
+    }
+
     mBiasBuffer.reset(new cl::Buffer(
-        runtime->context(), CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
+        runtime->context(), CL_MEM_READ_WRITE,
         bias_count * fbytes));
     {
-        cl_int err = CL_SUCCESS;
-        void* mapped = runtime->commandQueue().enqueueMapBuffer(
-                           *mBiasBuffer, CL_TRUE, CL_MAP_WRITE,
-                           0, bias_count * fbytes, nullptr, nullptr, &err);
-        MNN_CHECK_CL_SUCCESS(err, "map Conv3D bias buffer");
-
-        if (mOpenCLBackend->getPrecision() == BackendConfig::Precision_Low) {
-            ::memset(mapped, 0, bias_count * sizeof(uint16_t));
-            auto* dst = reinterpret_cast<uint16_t*>(mapped);
-
-            for (int c = 0; c < Cout; ++c) {
-                dst[c] = float_to_half(b_host ? b_host[c] : 0.0f);
-            }
-        } else {
-            ::memset(mapped, 0, bias_count * sizeof(float));
-            auto* dst = reinterpret_cast<float*>(mapped);
-
-            for (int c = 0; c < Cout; ++c) {
-                dst[c] = b_host ? b_host[c] : 0.0f;
-            }
-        }
-
-        runtime->commandQueue().enqueueUnmapMemObject(*mBiasBuffer, mapped);
+        cl_int err = runtime->commandQueue().enqueueWriteBuffer(
+            *mBiasBuffer, CL_TRUE, 0, bias_count * fbytes, host_bias.data());
+        MNN_CHECK_CL_SUCCESS(err, "write Conv3D bias buffer");
     }
 
     /* ----- Build the OpenCL kernel ------------------------------------- */
