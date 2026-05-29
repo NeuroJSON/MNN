@@ -227,8 +227,16 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
     auto in_d = TensorUtils::getDescribe(in);
     Tensor* read_from = in;
     bool use_nchw_kernel = false;
+    /* Read-from-origin shortcut is only safe for SINGLE-region
+     * MEMORY_VIRTUAL inputs. Multi-region inputs (e.g. from Concat,
+     * Slice, BinaryOp's broadcast-rasters, etc.) require the Raster
+     * materialization to actually run -- our kernel only consumes
+     * regions[0]->origin and would read garbage for channel ranges
+     * supplied by regions[1+]. Empirical SIAM test: at S64-scale
+     * mini-U-Net, the post-Concat Conv3D faults with CL_OUT_OF_RESOURCES
+     * when this guard is absent. */
     if (in_d->memoryType == Tensor::InsideDescribe::MEMORY_VIRTUAL
-        && !in_d->regions.empty()) {
+        && in_d->regions.size() == 1) {
         const auto& r = in_d->regions[0];
         bool identity = (r.src.offset == 0 && r.dst.offset == 0
                          && r.src.stride[0] == r.dst.stride[0]
@@ -304,6 +312,37 @@ public:
         OPENCL_CREATOR_CHECK(new Conv3DBufExecution(inputs, outputs, op, backend));
     }
 };
+
+ErrorCode Conv3DBufExecution::onExecute(const std::vector<Tensor*>& inputs,
+                                        const std::vector<Tensor*>& outputs) {
+    /* Optional per-op output sampling for debugging. Set MNN_CONV3D_PROBE=1
+     * in env to print the first 8 output floats after each Conv3D fires;
+     * useful for narrowing down which op in a pipeline first produces
+     * zero / NaN output. */
+    static int s_probe = -1;
+    if (s_probe < 0) {
+        const char* e = std::getenv("MNN_CONV3D_PROBE");
+        s_probe = (e && e[0] == '1') ? 1 : 0;
+    }
+
+    auto err = CommonExecution::onExecute(inputs, outputs);
+    if (s_probe) {
+        auto& out_buf = openCLBuffer(outputs[0]);
+        float buf[8] = {0};
+        auto q = mOpenCLBackend->getOpenCLRuntime()->commandQueue();
+        cl_int cret = q.enqueueReadBuffer(out_buf, CL_TRUE, 0, sizeof(buf), buf);
+        int nz = 0;
+        for (int i = 0; i < 8; ++i) if (buf[i] != 0.0f) nz++;
+        fprintf(stderr,
+                "[Conv3D::probe] Cin=%d Cout=%d s=(%d,%d,%d) out=(D=%d,H=%d,W=%d) "
+                "read_ret=%d nz=%d/8 first4=(%g,%g,%g,%g)\n",
+                mInputChannels, mOutputChannels,
+                mStrideD, mStrideH, mStrideW,
+                outputs[0]->length(2), outputs[0]->length(3), outputs[0]->length(4),
+                (int)cret, nz, buf[0], buf[1], buf[2], buf[3]);
+    }
+    return err;
+}
 
 REGISTER_OPENCL_OP_CREATOR(Conv3DBufCreator, OpType_Convolution3D, BUFFER);
 
