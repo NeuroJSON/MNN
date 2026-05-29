@@ -9,6 +9,7 @@
 #include "../TemplateMerge.hpp"
 #include <MNN/expr/ExprCreator.hpp>
 #include "MNN_generated.h"
+#include <cstdlib>  // for std::getenv
 
 namespace MNN {
 namespace Express {
@@ -223,43 +224,72 @@ static EXPRP _transformConvTranspose3DWithDeconvolution(EXPRP expr) {
     }
     return output->expr().first;
 }
+// Conv3D / ConvTranspose3D -> 2D decomposition.
+//
+// The original MNN converter ALWAYS rewrote Conv3D into ~40 Conv2D +
+// Im2Col + Unpack + Transpose ops because no backend had native
+// Conv3D / Deconv3D OpenCL/CUDA kernels. On SIAM-class 3D U-Nets this
+// blows a single forward pass up to ~3300 ops, which becomes
+// kernel-launch-bound on real GPUs (Titan V: ~6 min/fold, GPU pulses
+// briefly between long idle gaps).
+//
+// We now ship native Conv3DBufExecution / Deconv3DBufExecution in
+// source/backend/opencl/execution/buffer/ which let the OpenCL backend
+// handle these ops directly. Setting the env var
+//
+//     MNN_CONV3D_TURN2D=1
+//
+// at converter run time restores the legacy 2D-decomposition path
+// (useful when targeting a backend without native Conv3D support, e.g.
+// older OpenCL ICDs without our native kernels). The default behavior
+// is now to LEAVE Conv3D / ConvTranspose3D INTACT in the .mnn flatbuffer.
 static auto gRegister = []() {
-    {
-        auto compare = [](EXPRP expr) {
-            if (nullptr == expr->get()) {
-                return false;
-            }
-            if (expr->get()->type() != OpType_Convolution3D) {
-                return false;
-            }
-            return expr->get()->type() == OpType_Convolution3D && expr->inputs().size() == 1;
-        };
-        auto modify = [](EXPRP expr) {
-            auto newExpr = _transformConv3DWithConv2D(expr);
-            newExpr->setName(expr->name());
-            Expr::replace(expr, newExpr);
-            return true;
-        };
-        TemplateMerge::getInstance("Merge").insertTemplate("Convolution3DTurn2D", compare, modify, PASS_PRIORITY_MIDDLE);
+    const char* env = std::getenv("MNN_CONV3D_TURN2D");
+    const bool turn2d = (env != nullptr && env[0] == '1');
+
+    if (turn2d) {
+        {
+            auto compare = [](EXPRP expr) {
+                if (nullptr == expr->get()) {
+                    return false;
+                }
+
+                if (expr->get()->type() != OpType_Convolution3D) {
+                    return false;
+                }
+
+                return expr->get()->type() == OpType_Convolution3D && expr->inputs().size() == 1;
+            };
+            auto modify = [](EXPRP expr) {
+                auto newExpr = _transformConv3DWithConv2D(expr);
+                newExpr->setName(expr->name());
+                Expr::replace(expr, newExpr);
+                return true;
+            };
+            TemplateMerge::getInstance("Merge").insertTemplate("Convolution3DTurn2D", compare, modify, PASS_PRIORITY_MIDDLE);
+        }
+        {
+            auto compare = [](EXPRP expr) {
+                if (nullptr == expr->get()) {
+                    return false;
+                }
+
+                if (expr->get()->type() != OpType_ConvTranspose3D) {
+                    return false;
+                }
+
+                return expr->inputs().size() <= 2;
+            };
+            auto modify = [](EXPRP expr) {
+                auto newExpr = _transformConvTranspose3DWithDeconvolution(expr);
+                newExpr->setName(expr->name());
+                Expr::replace(expr, newExpr);
+                return true;
+            };
+            TemplateMerge::getInstance("Merge").insertTemplate("ConvolutionTranspose3DTurn2D", compare, modify, PASS_PRIORITY_MIDDLE);
+        }
     }
-    {
-        auto compare = [](EXPRP expr) {
-            if (nullptr == expr->get()) {
-                return false;
-            }
-            if (expr->get()->type() != OpType_ConvTranspose3D) {
-                return false;
-            }
-            return expr->inputs().size() <= 2;
-        };
-        auto modify = [](EXPRP expr) {
-            auto newExpr = _transformConvTranspose3DWithDeconvolution(expr);
-            newExpr->setName(expr->name());
-            Expr::replace(expr, newExpr);
-            return true;
-        };
-        TemplateMerge::getInstance("Merge").insertTemplate("ConvolutionTranspose3DTurn2D", compare, modify, PASS_PRIORITY_MIDDLE);
-    }
+
     return true;
 }();
 }
