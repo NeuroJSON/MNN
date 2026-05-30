@@ -292,27 +292,40 @@ public:
 #endif
 static void _create() {
 #ifdef MNN_SUPPORT_DEPRECATED_OPV2
-    /* Allow selective disable of the GeometryConv3D decomposition
-     * so a backend that registers a native Conv3D op-creator can take
-     * over (siamize's OpenCL Conv3DBufExecution lives in
-     * source/backend/opencl/execution/buffer/Conv3DBufExecution.cpp).
-     * Default behavior is unchanged: both Conv3D and ConvTranspose3D
-     * get decomposed into 2D primitives.
+    /* Allow selective disable of the GeometryConv3D / GeometryConvTranspose3D
+     * decompositions so a backend that registers a native Conv3D /
+     * ConvTranspose3D op-creator can take over.
      *
-     * Set env var SIAM_DISABLE_GEOM_CONV3D=1 to skip GeometryConv3D
-     * registration while keeping GeometryConvTranspose3D so existing
-     * 3D-deconv inference still works through the legacy 2D path
-     * (until we add a native Deconv3D too). */
-    const char* skip_env = std::getenv("SIAM_DISABLE_GEOM_CONV3D");
-    const bool skip_conv3d = (skip_env != nullptr && skip_env[0] == '1');
+     * siamize ships native OpenCL BUFFER kernels:
+     *   source/backend/opencl/execution/buffer/Conv3DBufExecution.cpp
+     *   source/backend/opencl/execution/buffer/Deconv3DBufExecution.cpp
+     *
+     * Default behavior is unchanged: both Conv3D and ConvTranspose3D get
+     * decomposed into 2D primitives via these geometry computers.
+     *
+     * Env vars (each independent, may be set together):
+     *   SIAM_DISABLE_GEOM_CONV3D=1    skip GeometryConv3D
+     *   SIAM_DISABLE_GEOM_DECONV3D=1  skip GeometryConvTranspose3D
+     *
+     * The ConvTranspose3D opt-out matters on Nvidia OpenCL because
+     * GeometryConvTranspose3D below allocates a virtual
+     * (1, batch*oc*kd*kh*kw, batch*oc*od*oh*ow) tensor whose Reduce
+     * step silently zeros or kernel-faults at SIAM v0.3 decoder scale
+     * (oc=256, k=3, od*oh*ow ~= 9216). */
+    const char* skip_conv_env   = std::getenv("SIAM_DISABLE_GEOM_CONV3D");
+    const char* skip_deconv_env = std::getenv("SIAM_DISABLE_GEOM_DECONV3D");
+    const bool skip_conv3d   = (skip_conv_env   != nullptr && skip_conv_env[0]   == '1');
+    const bool skip_deconv3d = (skip_deconv_env != nullptr && skip_deconv_env[0] == '1');
 
     if (!skip_conv3d) {
         std::shared_ptr<GeometryComputer> comp(new GeometryConv3D);
         GeometryComputer::registerGeometryComputer(comp, {OpType_Convolution3D});
     }
 
-    std::shared_ptr<GeometryComputer> comp2(new GeometryConvTranspose3D);
-    GeometryComputer::registerGeometryComputer(comp2, {OpType_ConvTranspose3D});
+    if (!skip_deconv3d) {
+        std::shared_ptr<GeometryComputer> comp2(new GeometryConvTranspose3D);
+        GeometryComputer::registerGeometryComputer(comp2, {OpType_ConvTranspose3D});
+    }
 #endif
 }
 

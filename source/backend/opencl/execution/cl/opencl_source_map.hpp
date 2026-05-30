@@ -121,6 +121,9 @@ extern const char* self_attention_buf;
 extern const char* gemm_conv1x1_buf;
 #endif
 extern const char* binary;
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* deconv_3d_buf;
+#endif
 extern const char* winogradTransformSource2_5_1;
 extern const char* raster;
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -297,6 +300,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "gemm_conv1x1_buf", gemm_conv1x1_buf },
 #endif
   { "binary", binary },
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "deconv_3d_buf", deconv_3d_buf },
+#endif
   { "winogradTransformSource2_5_1", winogradTransformSource2_5_1 },
   { "raster", raster },
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -407,6 +413,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "self_attention_buf", "653a99a0693d9173084de43e577f9cfd" },
   { "gemm_conv1x1_buf", "5f8fd2f6e8278a2e003825a001b733ac" },
   { "binary", "5683a6a6fd24660f0d05a70938fa6a62" },
+  { "deconv_3d_buf", "6decd7fa877dc27ed5b2f42ca4e4c49d" },
   { "winogradTransformSource2_5_1", "f0ee12556faf4fe0222e2a4e64c53c5c" },
   { "raster", "0cf8ee1f7927d0027ce0f07ad564266e" },
   { "binary_buf", "6c5ee786c70aa485d9b49368517296e3" },
