@@ -11,8 +11,17 @@
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+#include <ctime>
+#include <map>
+#include <tuple>
+#include <vector>
+
 namespace MNN {
 namespace OpenCL {
+
+typedef std::tuple<int, int, int, int, int, int, int, int> Deconv3DSig;
 
 static inline int up_div(int x, int d) {
     return (x + d - 1) / d;
@@ -284,7 +293,58 @@ ErrorCode Deconv3DBufExecution::onExecute(const std::vector<Tensor*>& inputs,
         s_probe = (e && e[0] == '1') ? 1 : 0;
     }
 
+    static int s_timing = -1;
+    if (s_timing < 0) {
+        const char* e = std::getenv("MNN_DECONV3D_TIMING");
+        s_timing = (e && e[0] == '1') ? 1 : 0;
+    }
+    auto runtime = mOpenCLBackend->getOpenCLRuntime();
+    auto q = runtime->commandQueue();
+    static std::map<Deconv3DSig, std::pair<double, int>> s_acc;
+    double t0 = 0.0;
+    if (s_timing) {
+        q.finish();
+        t0 = static_cast<double>(clock());
+    }
+
     auto err = CommonExecution::onExecute(inputs, outputs);
+
+    if (s_timing) {
+        q.finish();
+        double dt_us = (static_cast<double>(clock()) - t0) / CLOCKS_PER_SEC * 1.0e6;
+        Deconv3DSig sig{mInputChannels, mOutputChannels,
+                        outputs[0]->length(2), outputs[0]->length(3), outputs[0]->length(4),
+                        mStrideD, mStrideH, mStrideW};
+        auto& slot = s_acc[sig];
+        slot.first  += dt_us;
+        slot.second += 1;
+        static bool s_registered = false;
+        if (!s_registered) {
+            s_registered = true;
+            std::atexit([]() {
+                fprintf(stderr, "\n[Deconv3D::timing] shape (Cin,Cout,Dout,Hout,Wout,sd,sh,sw)  n_calls  total_ms  avg_us\n");
+                std::vector<std::pair<Deconv3DSig, std::pair<double, int>>> items(s_acc.begin(), s_acc.end());
+                std::sort(items.begin(), items.end(),
+                          [](const std::pair<Deconv3DSig, std::pair<double, int>>& a,
+                             const std::pair<Deconv3DSig, std::pair<double, int>>& b) {
+                              return a.second.first > b.second.first;
+                          });
+                double grand = 0;
+                for (auto& it : items) grand += it.second.first;
+                for (auto& it : items) {
+                    auto& s = it.first;
+                    fprintf(stderr, "  Cin=%-4d Cout=%-4d D=%-3d H=%-3d W=%-3d s=(%d,%d,%d)  n=%-4d total=%7.1f ms avg=%6.1f us  pct=%5.1f%%\n",
+                            std::get<0>(s), std::get<1>(s), std::get<2>(s), std::get<3>(s), std::get<4>(s),
+                            std::get<5>(s), std::get<6>(s), std::get<7>(s),
+                            it.second.second, it.second.first / 1000.0,
+                            it.second.first / it.second.second,
+                            100.0 * it.second.first / grand);
+                }
+                fprintf(stderr, "  [Deconv3D total]: %.1f ms across %zu shapes\n",
+                        grand / 1000.0, s_acc.size());
+            });
+        }
+    }
     if (s_probe) {
         auto& out_buf = openCLBuffer(outputs[0]);
         float buf[8] = {0};
