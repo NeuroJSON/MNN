@@ -298,8 +298,7 @@ ErrorCode Deconv3DBufExecution::onExecute(const std::vector<Tensor*>& inputs,
         const char* e = std::getenv("MNN_DECONV3D_TIMING");
         s_timing = (e && e[0] == '1') ? 1 : 0;
     }
-    auto runtime = mOpenCLBackend->getOpenCLRuntime();
-    auto q = runtime->commandQueue();
+    auto q = mOpenCLBackend->getOpenCLRuntime()->commandQueue();
     static std::map<Deconv3DSig, std::pair<double, int>> s_acc;
     double t0 = 0.0;
     if (s_timing) {

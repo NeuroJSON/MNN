@@ -372,8 +372,7 @@ ErrorCode Conv3DBufExecution::onExecute(const std::vector<Tensor*>& inputs,
         s_timing = (e && e[0] == '1') ? 1 : 0;
     }
 
-    auto runtime = mOpenCLBackend->getOpenCLRuntime();
-    auto q = runtime->commandQueue();
+    auto q = mOpenCLBackend->getOpenCLRuntime()->commandQueue();
     /* Accumulator keyed by Conv3DSig (Cin,Cout,Dout,Hout,Wout,sd,sh,sw).
      * Defined at file scope so a portable comparator type can be named. */
     static std::map<Conv3DSig, std::pair<double, int>> s_acc; // total_us, n_calls
