@@ -64,13 +64,21 @@ private:
     std::shared_ptr<cl::Buffer> mKernelBuffer;
     std::shared_ptr<cl::Buffer> mBiasBuffer;
 
-    // Two kernel variants: NC4HW4 reader for standard inputs, NCHW
-    // reader for inputs we can take directly from a MEMORY_VIRTUAL
-    // Region's NCHW source. Picked per-encode based on input layout.
-    std::shared_ptr<KernelWrap> mKernelNC4 = nullptr;
-    std::shared_ptr<KernelWrap> mKernelNCHW = nullptr;
-    uint32_t mMaxWGS_NC4  = 1;
-    uint32_t mMaxWGS_NCHW = 1;
+    // Kernel variants:
+    //   mKernelNC4    : NC4HW4 in/out, 1 output float4 per work-item
+    //   mKernelNC4T22 : NC4HW4 in/out, 2x2 (H,W) output tile per work-item
+    //                   (3-4x faster for the SIAM-dominant Cin/Cout=64..256
+    //                    3x3x3 stride=1 shapes; same numerical output up to
+    //                    fp32 reduction-order noise).
+    //   mKernelNCHW   : NCHW reader for inputs taken directly from a
+    //                   MEMORY_VIRTUAL Region's NCHW source.
+    // Picked per-encode based on input layout + shape.
+    std::shared_ptr<KernelWrap> mKernelNC4    = nullptr;
+    std::shared_ptr<KernelWrap> mKernelNC4T22 = nullptr;
+    std::shared_ptr<KernelWrap> mKernelNCHW   = nullptr;
+    uint32_t mMaxWGS_NC4    = 1;
+    uint32_t mMaxWGS_NC4T22 = 1;
+    uint32_t mMaxWGS_NCHW   = 1;
 
     // Per-launch global / local work sizes resolved in onEncode().
     std::vector<uint32_t> mGWS{1, 1, 1};

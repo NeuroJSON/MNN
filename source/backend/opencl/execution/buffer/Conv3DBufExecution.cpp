@@ -199,6 +199,11 @@ Conv3DBufExecution::Conv3DBufExecution(const std::vector<Tensor*>& inputs,
     OPENCL_CHECK_KERNEL_CTOR(mKernelNC4);
     mMaxWGS_NC4 = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernelNC4));
 
+    mKernelNC4T22 = runtime->buildKernel("conv_3d_buf", "conv_3d_buf_nc4dhw4_t22",
+                                         buildOptions, mOpenCLBackend->getPrecision());
+    OPENCL_CHECK_KERNEL_CTOR(mKernelNC4T22);
+    mMaxWGS_NC4T22 = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernelNC4T22));
+
     mKernelNCHW = runtime->buildKernel("conv_3d_buf", "conv_3d_buf_nchw_in",
                                        buildOptions, mOpenCLBackend->getPrecision());
     OPENCL_CHECK_KERNEL_CTOR(mKernelNCHW);
@@ -227,6 +232,8 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
     const int Cinblk  = up_div(Cin, 4);
     const int Coutblk = up_div(Cout, 4);
 
+    /* Default GWS for the single-output kernel. The tiled kernel below
+     * halves dim0/dim1 if selected. */
     mGWS[0] = static_cast<uint32_t>(Wout);
     mGWS[1] = static_cast<uint32_t>(Dout * Hout);
     mGWS[2] = static_cast<uint32_t>(Coutblk);
@@ -263,9 +270,26 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
         }
     }
 
+    /* When the input is NC4HW4 (the common case) and the output has
+     * at least 2 spatial cells along W (so the 2x2 tile is worth
+     * launching), use the tiled kernel. Disable via MNN_CONV3D_NOTILE=1
+     * for A/B comparison or to bypass if a regression is found. */
+    static int s_notile = -1;
+    if (s_notile < 0) {
+        const char* e = std::getenv("MNN_CONV3D_NOTILE");
+        s_notile = (e && e[0] == '1') ? 1 : 0;
+    }
+    const bool can_tile = !use_nchw_kernel && (Wout >= 2) && (s_notile == 0);
+
     if (use_nchw_kernel) {
         unit.kernel = mKernelNCHW;
         mMaxWorkGroupSize = mMaxWGS_NCHW;
+    } else if (can_tile) {
+        unit.kernel = mKernelNC4T22;
+        mMaxWorkGroupSize = mMaxWGS_NC4T22;
+        /* Halve dim0 (ceil) and dim1's Hout factor (ceil). */
+        mGWS[0] = static_cast<uint32_t>((Wout + 1) >> 1);
+        mGWS[1] = static_cast<uint32_t>(Dout * ((Hout + 1) >> 1));
     } else {
         unit.kernel = mKernelNC4;
         mMaxWorkGroupSize = mMaxWGS_NC4;
@@ -301,9 +325,11 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
     ret |= unit.kernel->get().setArg(idx++, static_cast<int>(mPadW));
     MNN_CHECK_CL_SUCCESS(ret, "setArg Conv3DBufExecution");
 
+    const char* kname = use_nchw_kernel ? "conv_3d_buf_nchw_in"
+                        : (can_tile ? "conv_3d_buf_nc4dhw4_t22"
+                                    : "conv_3d_buf_nc4dhw4");
     mLWS = localWS3DDefault(mGWS, mMaxWorkGroupSize, runtime,
-                            use_nchw_kernel ? "conv_3d_buf_nchw_in"
-                                            : "conv_3d_buf_nc4dhw4",
+                            kname,
                             unit.kernel,
                             mOpenCLBackend->getCLTuneLevel(),
                             "conv_3d_buf").first;

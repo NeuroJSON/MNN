@@ -173,6 +173,174 @@ __kernel void conv_3d_buf_nc4dhw4(GLOBAL_SIZE_3_DIMS
 }
 
 /*
+ * conv_3d_buf_nc4dhw4_t22
+ *
+ * 2x2 output-tile variant of conv_3d_buf_nc4dhw4. Each work-item now
+ * produces FOUR output float4s (2 along H, 2 along W) at one (od, oc_blk),
+ * so the weight tile loaded for each (kdi, khi, kwi, ic_blk) is reused
+ * across 4 outputs instead of 1.
+ *
+ * SIAM benefit: weight-load bandwidth drops 4x; input-load bandwidth
+ * stays roughly the same per output (the 2x2 outputs read from slightly
+ * overlapping but mostly distinct input voxels). For our memory-bound
+ * naive kernel this gives roughly 3-4x speedup on the dominant Conv3D
+ * shapes (Cin=Cout=64..256, stride=1, 3x3x3).
+ *
+ * Global work size:
+ *   dim0 : ceil(out_w / 2)
+ *   dim1 : out_d * ceil(out_h / 2)
+ *   dim2 : out_cblock
+ *
+ * Boundary handling: when out_w or out_h is odd, the last work-item
+ * has its ow1 / oh1 lane out of range; per-lane stores are guarded
+ * by  if (ow1 < out_w)  and  if (oh1 < out_h)  to leave odd-tail
+ * voxels untouched by the tiled kernel.
+ */
+__kernel void conv_3d_buf_nc4dhw4_t22(GLOBAL_SIZE_3_DIMS
+                                       __global const FLOAT *input,
+                                       __global const FLOAT *weight,
+                                       __global const FLOAT *bias,
+                                       __global FLOAT *output,
+                                       __private const int in_cblock,
+                                       __private const int in_d,
+                                       __private const int in_h,
+                                       __private const int in_w,
+                                       __private const int out_d,
+                                       __private const int out_h,
+                                       __private const int out_w,
+                                       __private const int kd,
+                                       __private const int kh,
+                                       __private const int kw,
+                                       __private const int sd,
+                                       __private const int sh,
+                                       __private const int sw,
+                                       __private const int pd,
+                                       __private const int ph,
+                                       __private const int pw) {
+    const int gid_w  = get_global_id(0);   /* covers ow0, ow1=ow0+1 */
+    const int gid_dh = get_global_id(1);   /* od * out_h_pairs + oh_pair */
+    const int gid_cb = get_global_id(2);
+    DEAL_NON_UNIFORM_DIM3(gid_w, gid_dh, gid_cb);
+
+    const int ow0 = gid_w * 2;
+    const int ow1 = ow0 + 1;
+    const int out_h_pairs = (out_h + 1) >> 1;
+    const int oh_pair = gid_dh % out_h_pairs;
+    const int od     = gid_dh / out_h_pairs;
+    const int oh0 = oh_pair * 2;
+    const int oh1 = oh0 + 1;
+    const int oc_blk = gid_cb;
+
+    /* Four accumulators, one per spatial output position in the tile. */
+    COMPUTE_FLOAT4 bias_v = CONVERT_COMPUTE_FLOAT4(vload4(oc_blk, bias));
+    COMPUTE_FLOAT4 acc00 = bias_v;
+    COMPUTE_FLOAT4 acc01 = bias_v;
+    COMPUTE_FLOAT4 acc10 = bias_v;
+    COMPUTE_FLOAT4 acc11 = bias_v;
+
+    const int in_d_base  = od  * sd - pd;
+    const int in_h_base0 = oh0 * sh - ph;
+    const int in_h_base1 = oh1 * sh - ph;
+    const int in_w_base0 = ow0 * sw - pw;
+    const int in_w_base1 = ow1 * sw - pw;
+
+    const int w_kvol    = kd * kh * kw;
+    const int w_per_oc  = w_kvol * in_cblock * 4 * 4;
+    const int w_oc_base = oc_blk * w_per_oc;
+
+    for (int kdi = 0; kdi < kd; ++kdi) {
+        const int idz = in_d_base + kdi;
+        if (idz < 0 || idz >= in_d) {
+            continue;
+        }
+
+        for (int khi = 0; khi < kh; ++khi) {
+            const int idy00 = in_h_base0 + khi;
+            const int idy10 = in_h_base1 + khi;
+            const bool vy0  = (idy00 >= 0 && idy00 < in_h);
+            const bool vy1  = (idy10 >= 0 && idy10 < in_h) && (oh1 < out_h);
+
+            for (int kwi = 0; kwi < kw; ++kwi) {
+                const int idx00 = in_w_base0 + kwi;
+                const int idx01 = in_w_base1 + kwi;
+                const bool vx0  = (idx00 >= 0 && idx00 < in_w);
+                const bool vx1  = (idx01 >= 0 && idx01 < in_w) && (ow1 < out_w);
+
+                /* Skip the whole inner-channel loop if no output lane
+                 * in this 2x2 tile gets a contribution from this (kd,kh,kw). */
+                if (!(vy0 && (vx0 || vx1)) && !(vy1 && (vx0 || vx1))) {
+                    continue;
+                }
+
+                const int w_kpos_base = w_oc_base
+                                        + ((kdi * kh + khi) * kw + kwi) * in_cblock * 16;
+
+                for (int ic_blk = 0; ic_blk < in_cblock; ++ic_blk) {
+                    /* Load the 4x4 weight tile ONCE; reuse across all 4 outputs. */
+                    const int w_offset = w_kpos_base + ic_blk * 16;
+                    COMPUTE_FLOAT4 w0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_offset));
+                    COMPUTE_FLOAT4 w1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_offset +  4));
+                    COMPUTE_FLOAT4 w2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_offset +  8));
+                    COMPUTE_FLOAT4 w3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_offset + 12));
+
+                    const int row_base = (ic_blk * in_d + idz) * in_h;
+
+                    if (vy0) {
+                        const int spat_h0 = row_base + idy00;
+                        if (vx0) {
+                            COMPUTE_FLOAT4 v = CONVERT_COMPUTE_FLOAT4(vload4(spat_h0 * in_w + idx00, input));
+                            acc00 = mad((COMPUTE_FLOAT4)(v.x), w0, acc00);
+                            acc00 = mad((COMPUTE_FLOAT4)(v.y), w1, acc00);
+                            acc00 = mad((COMPUTE_FLOAT4)(v.z), w2, acc00);
+                            acc00 = mad((COMPUTE_FLOAT4)(v.w), w3, acc00);
+                        }
+                        if (vx1) {
+                            COMPUTE_FLOAT4 v = CONVERT_COMPUTE_FLOAT4(vload4(spat_h0 * in_w + idx01, input));
+                            acc01 = mad((COMPUTE_FLOAT4)(v.x), w0, acc01);
+                            acc01 = mad((COMPUTE_FLOAT4)(v.y), w1, acc01);
+                            acc01 = mad((COMPUTE_FLOAT4)(v.z), w2, acc01);
+                            acc01 = mad((COMPUTE_FLOAT4)(v.w), w3, acc01);
+                        }
+                    }
+                    if (vy1) {
+                        const int spat_h1 = row_base + idy10;
+                        if (vx0) {
+                            COMPUTE_FLOAT4 v = CONVERT_COMPUTE_FLOAT4(vload4(spat_h1 * in_w + idx00, input));
+                            acc10 = mad((COMPUTE_FLOAT4)(v.x), w0, acc10);
+                            acc10 = mad((COMPUTE_FLOAT4)(v.y), w1, acc10);
+                            acc10 = mad((COMPUTE_FLOAT4)(v.z), w2, acc10);
+                            acc10 = mad((COMPUTE_FLOAT4)(v.w), w3, acc10);
+                        }
+                        if (vx1) {
+                            COMPUTE_FLOAT4 v = CONVERT_COMPUTE_FLOAT4(vload4(spat_h1 * in_w + idx01, input));
+                            acc11 = mad((COMPUTE_FLOAT4)(v.x), w0, acc11);
+                            acc11 = mad((COMPUTE_FLOAT4)(v.y), w1, acc11);
+                            acc11 = mad((COMPUTE_FLOAT4)(v.z), w2, acc11);
+                            acc11 = mad((COMPUTE_FLOAT4)(v.w), w3, acc11);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Write the 2x2 outputs; guard the upper edges. */
+    const int out_row = (oc_blk * out_d + od) * out_h;
+    const int out_voxel00 = (out_row + oh0) * out_w + ow0;
+    vstore4(CONVERT_FLOAT4(acc00), out_voxel00, output);
+    if (ow1 < out_w) {
+        vstore4(CONVERT_FLOAT4(acc01), out_voxel00 + 1, output);
+    }
+    if (oh1 < out_h) {
+        const int out_voxel10 = (out_row + oh1) * out_w + ow0;
+        vstore4(CONVERT_FLOAT4(acc10), out_voxel10, output);
+        if (ow1 < out_w) {
+            vstore4(CONVERT_FLOAT4(acc11), out_voxel10 + 1, output);
+        }
+    }
+}
+
+/*
  * conv_3d_buf_nchw_in
  *
  * Variant that reads its INPUT as plain unpacked NCHW (1, C, D*H*W)
