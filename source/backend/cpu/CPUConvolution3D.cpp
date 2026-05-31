@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 #include "backend/cpu/CPUBackend.hpp"
 #include "core/Concurrency.h"
@@ -61,21 +62,7 @@ CPUConvolution3D::CPUConvolution3D(Backend* backend, const MNN::Op* op)
 
 ErrorCode CPUConvolution3D::onResize(const std::vector<Tensor*>& /*inputs*/,
                                      const std::vector<Tensor*>& /*outputs*/) {
-    // The framework's SizeComputer (ShapeConvolution3D) already filled the
-    // output shape; we have no per-resize scratch buffers in the MVP path.
     return NO_ERROR;
-}
-
-static inline float fuse_act_(float v, bool relu, bool relu6) {
-    if (relu6) {
-        if (v < 0.0f) return 0.0f;
-        if (v > 6.0f) return 6.0f;
-        return v;
-    }
-    if (relu) {
-        return v < 0.0f ? 0.0f : v;
-    }
-    return v;
 }
 
 ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
@@ -108,12 +95,12 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
         padLeftW  = needW / 2;
     }
 
-    const float* inputData  = in->host<float>();
-    float*       outputData = out->host<float>();
-    const float* weightData = mWeight.data();
-    const float* biasData   = mBias.data();
-    const bool   relu  = mRelu;
-    const bool   relu6 = mRelu6;
+    const float* __restrict__ inputData  = in->host<float>();
+    float*       __restrict__ outputData = out->host<float>();
+    const float* __restrict__ weightData = mWeight.data();
+    const float* __restrict__ biasData   = mBias.data();
+    const bool relu  = mRelu;
+    const bool relu6 = mRelu6;
 
     const std::int64_t inStrideC  = static_cast<std::int64_t>(ID) * IH * IW;
     const std::int64_t inStrideN  = static_cast<std::int64_t>(IC) * inStrideC;
@@ -126,41 +113,134 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
     auto cpuBackend = static_cast<CPUBackend*>(backend());
     const int threadNumber = std::max(1, cpuBackend->threadNumber());
 
+    // Loop structure:
+    //
+    //   Outer parallel over (oc * od) — gives more work units than just oc
+    //   for finer load balancing on hosts with more threads than channels.
+    //
+    //   Per (oc, od), iterate (oh):
+    //     Initialize a per-row accumulator rowAcc[OW] with bias.
+    //     For each input channel ic, walk the valid kernel taps (kd, kh, kw)
+    //     and add the windowed input * weight to the accumulator.
+    //     The INNERMOST loop is over `ow` with stride-1 contiguous input
+    //     (when SW=1) — compiler auto-vectorizes the SIMD-FMA there. For
+    //     SW>1 the loop is still branch-free; the compiler vectorizes
+    //     with strided loads.
+    //
+    //   Bounds checks on (kd, kh) are hoisted outside the channel loop;
+    //   the inner ow loop runs over a pre-computed valid range so no
+    //   per-element padding branch remains.
+
     for (int n = 0; n < N; ++n) {
-        const float* in_n  = inputData  + n * inStrideN;
-        float*       out_n = outputData + n * outStrideN;
+        const float* __restrict__ in_n  = inputData + n * inStrideN;
+        float*       __restrict__ out_n = outputData + n * outStrideN;
 
         MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
-            for (int oc = static_cast<int>(tId); oc < OC; oc += threadNumber) {
-                float*       out_oc = out_n + oc * outStrideC;
-                const float* w_oc   = weightData + oc * wStrideOC;
-                const float  bias   = biasData[oc];
+            std::vector<float> rowAcc(static_cast<size_t>(OW), 0.0f);
 
-                for (int od = 0; od < OD; ++od) {
-                    for (int oh = 0; oh < OH; ++oh) {
-                        float* out_row = out_oc + (static_cast<std::int64_t>(od) * OH + oh) * OW;
-                        for (int ow = 0; ow < OW; ++ow) {
-                            float acc = bias;
-                            for (int ic = 0; ic < IC; ++ic) {
-                                const float* in_ic = in_n + ic * inStrideC;
-                                const float* w_ic  = w_oc + ic * wStrideIC;
-                                for (int kd = 0; kd < KD; ++kd) {
-                                    const int id = od * SD - padFrontD + kd * DD;
-                                    if (id < 0 || id >= ID) continue;
-                                    for (int kh = 0; kh < KH; ++kh) {
-                                        const int ih = oh * SH - padTopH + kh * DH;
-                                        if (ih < 0 || ih >= IH) continue;
-                                        const float* in_row = in_ic + (static_cast<std::int64_t>(id) * IH + ih) * IW;
-                                        const float* w_row  = w_ic  + kd * wStrideKD + kh * KW;
-                                        for (int kw = 0; kw < KW; ++kw) {
-                                            const int iw = ow * SW - padLeftW + kw * DW;
-                                            if (iw < 0 || iw >= IW) continue;
-                                            acc += in_row[iw] * w_row[kw];
+            const int totalUnits = OC * OD;
+            for (int unit = static_cast<int>(tId); unit < totalUnits; unit += threadNumber) {
+                const int oc = unit / OD;
+                const int od = unit % OD;
+
+                // valid kd range so that id = od*SD - padFrontD + kd*DD lies in [0, ID)
+                int kdLo = 0;
+                int kdHi = KD;
+                {
+                    const int id_at_0 = od * SD - padFrontD;
+                    while (kdLo < KD && id_at_0 + kdLo * DD < 0) ++kdLo;
+                    while (kdHi > kdLo && id_at_0 + (kdHi - 1) * DD >= ID) --kdHi;
+                }
+
+                float*       __restrict__ out_oc_od = out_n + oc * outStrideC
+                                                     + static_cast<std::int64_t>(od) * OH * OW;
+                const float* __restrict__ w_oc = weightData + oc * wStrideOC;
+                const float  bias = biasData[oc];
+
+                for (int oh = 0; oh < OH; ++oh) {
+                    int khLo = 0;
+                    int khHi = KH;
+                    {
+                        const int ih_at_0 = oh * SH - padTopH;
+                        while (khLo < KH && ih_at_0 + khLo * DH < 0) ++khLo;
+                        while (khHi > khLo && ih_at_0 + (khHi - 1) * DH >= IH) --khHi;
+                    }
+
+                    for (int ow = 0; ow < OW; ++ow) {
+                        rowAcc[ow] = bias;
+                    }
+
+                    for (int ic = 0; ic < IC; ++ic) {
+                        const float* __restrict__ in_ic_n = in_n + ic * inStrideC;
+                        const float* __restrict__ w_ic    = w_oc + ic * wStrideIC;
+
+                        for (int kd = kdLo; kd < kdHi; ++kd) {
+                            const int id = od * SD - padFrontD + kd * DD;
+                            const float* __restrict__ in_d = in_ic_n
+                                                             + static_cast<std::int64_t>(id) * IH * IW;
+                            const float* __restrict__ w_d  = w_ic + kd * wStrideKD;
+
+                            for (int kh = khLo; kh < khHi; ++kh) {
+                                const int ih = oh * SH - padTopH + kh * DH;
+                                const float* __restrict__ in_row = in_d
+                                                                   + static_cast<std::int64_t>(ih) * IW;
+                                const float* __restrict__ w_row  = w_d + kh * KW;
+
+                                for (int kw = 0; kw < KW; ++kw) {
+                                    const float w = w_row[kw];
+
+                                    // For each output ow:
+                                    //   iw = ow * SW + (kw * DW - padLeftW)
+                                    //   valid when iw in [0, IW)
+                                    const int iw_off = kw * DW - padLeftW;
+                                    int owLo, owHi;
+                                    if (SW <= 0) {
+                                        owLo = 0;
+                                        owHi = 0;
+                                    } else {
+                                        owLo = (-iw_off + SW - 1) / SW;
+                                        if (owLo < 0) owLo = 0;
+                                        const int upper = IW - 1 - iw_off;
+                                        owHi = (upper < 0) ? 0 : (upper / SW + 1);
+                                        if (owHi > OW) owHi = OW;
+                                        if (owLo > owHi) owLo = owHi;
+                                    }
+
+                                    if (SW == 1) {
+                                        // Hot path for stride-1: contiguous load over
+                                        // in_row, contiguous store into rowAcc -- compiler
+                                        // auto-vectorizes the FMA.
+                                        const float* __restrict__ src = in_row + iw_off;
+                                        for (int ow = owLo; ow < owHi; ++ow) {
+                                            rowAcc[ow] += src[ow] * w;
+                                        }
+                                    } else {
+                                        for (int ow = owLo; ow < owHi; ++ow) {
+                                            const int iw = ow * SW + iw_off;
+                                            rowAcc[ow] += in_row[iw] * w;
                                         }
                                     }
                                 }
                             }
-                            out_row[ow] = fuse_act_(acc, relu, relu6);
+                        }
+                    }
+
+                    float* __restrict__ out_row = out_oc_od + static_cast<std::int64_t>(oh) * OW;
+                    if (relu6) {
+                        for (int ow = 0; ow < OW; ++ow) {
+                            float v = rowAcc[ow];
+                            if (v < 0.0f) v = 0.0f;
+                            else if (v > 6.0f) v = 6.0f;
+                            out_row[ow] = v;
+                        }
+                    } else if (relu) {
+                        for (int ow = 0; ow < OW; ++ow) {
+                            float v = rowAcc[ow];
+                            out_row[ow] = v < 0.0f ? 0.0f : v;
+                        }
+                    } else {
+                        for (int ow = 0; ow < OW; ++ow) {
+                            out_row[ow] = rowAcc[ow];
                         }
                     }
                 }
