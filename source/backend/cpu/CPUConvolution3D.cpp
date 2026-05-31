@@ -131,19 +131,36 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
     //   the inner ow loop runs over a pre-computed valid range so no
     //   per-element padding branch remains.
 
+    // Outer-product blocking: process OC_BLOCK output channels per inner
+    // iteration. Each input load feeds OC_BLOCK FMAs (memory bandwidth
+    // amortization). SIAM's OC values (32, 64, 128, 256, 320) are all
+    // multiples of 4 -- empirically OC_BLOCK=4 outperforms 8 on AVX2
+    // x86_64: OC=8 doubles the accumulator buffer (still fits in L1 but
+    // straddles more cache lines) and exhausts AVX2's 16 ymm registers
+    // once you include input broadcast + weight broadcasts, causing
+    // register spills. The partial-block path is kept for other models.
+    constexpr int OC_BLOCK = 4;
+    const int ocBlocks = (OC + OC_BLOCK - 1) / OC_BLOCK;
+
     for (int n = 0; n < N; ++n) {
         const float* __restrict__ in_n  = inputData + n * inStrideN;
         float*       __restrict__ out_n = outputData + n * outStrideN;
 
         MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
-            std::vector<float> rowAcc(static_cast<size_t>(OW), 0.0f);
+            std::vector<float> rowAccBuf(static_cast<size_t>(OC_BLOCK) * OW, 0.0f);
+            float* const acc0 = rowAccBuf.data() + 0 * OW;
+            float* const acc1 = rowAccBuf.data() + 1 * OW;
+            float* const acc2 = rowAccBuf.data() + 2 * OW;
+            float* const acc3 = rowAccBuf.data() + 3 * OW;
 
-            const int totalUnits = OC * OD;
+            const int totalUnits = ocBlocks * OD;
             for (int unit = static_cast<int>(tId); unit < totalUnits; unit += threadNumber) {
-                const int oc = unit / OD;
-                const int od = unit % OD;
+                const int ocb   = unit / OD;
+                const int od    = unit % OD;
+                const int oc_lo = ocb * OC_BLOCK;
+                const int oc_hi = std::min(oc_lo + OC_BLOCK, OC);
+                const int oc_n  = oc_hi - oc_lo;
 
-                // valid kd range so that id = od*SD - padFrontD + kd*DD lies in [0, ID)
                 int kdLo = 0;
                 int kdHi = KD;
                 {
@@ -152,10 +169,15 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                     while (kdHi > kdLo && id_at_0 + (kdHi - 1) * DD >= ID) --kdHi;
                 }
 
-                float*       __restrict__ out_oc_od = out_n + oc * outStrideC
-                                                     + static_cast<std::int64_t>(od) * OH * OW;
-                const float* __restrict__ w_oc = weightData + oc * wStrideOC;
-                const float  bias = biasData[oc];
+                const float* __restrict__ w_oc0 = weightData + (oc_lo + 0) * wStrideOC;
+                const float* __restrict__ w_oc1 = oc_n > 1 ? weightData + (oc_lo + 1) * wStrideOC : w_oc0;
+                const float* __restrict__ w_oc2 = oc_n > 2 ? weightData + (oc_lo + 2) * wStrideOC : w_oc0;
+                const float* __restrict__ w_oc3 = oc_n > 3 ? weightData + (oc_lo + 3) * wStrideOC : w_oc0;
+
+                const float bias0 = biasData[oc_lo + 0];
+                const float bias1 = oc_n > 1 ? biasData[oc_lo + 1] : 0.0f;
+                const float bias2 = oc_n > 2 ? biasData[oc_lo + 2] : 0.0f;
+                const float bias3 = oc_n > 3 ? biasData[oc_lo + 3] : 0.0f;
 
                 for (int oh = 0; oh < OH; ++oh) {
                     int khLo = 0;
@@ -166,32 +188,33 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                         while (khHi > khLo && ih_at_0 + (khHi - 1) * DH >= IH) --khHi;
                     }
 
-                    for (int ow = 0; ow < OW; ++ow) {
-                        rowAcc[ow] = bias;
-                    }
+                    for (int ow = 0; ow < OW; ++ow) acc0[ow] = bias0;
+                    for (int ow = 0; ow < OW; ++ow) acc1[ow] = bias1;
+                    for (int ow = 0; ow < OW; ++ow) acc2[ow] = bias2;
+                    for (int ow = 0; ow < OW; ++ow) acc3[ow] = bias3;
 
                     for (int ic = 0; ic < IC; ++ic) {
                         const float* __restrict__ in_ic_n = in_n + ic * inStrideC;
-                        const float* __restrict__ w_ic    = w_oc + ic * wStrideIC;
+                        const std::int64_t w_ic_off = static_cast<std::int64_t>(ic) * wStrideIC;
 
                         for (int kd = kdLo; kd < kdHi; ++kd) {
                             const int id = od * SD - padFrontD + kd * DD;
                             const float* __restrict__ in_d = in_ic_n
                                                              + static_cast<std::int64_t>(id) * IH * IW;
-                            const float* __restrict__ w_d  = w_ic + kd * wStrideKD;
+                            const std::int64_t w_kd_off = w_ic_off + static_cast<std::int64_t>(kd) * wStrideKD;
 
                             for (int kh = khLo; kh < khHi; ++kh) {
                                 const int ih = oh * SH - padTopH + kh * DH;
                                 const float* __restrict__ in_row = in_d
                                                                    + static_cast<std::int64_t>(ih) * IW;
-                                const float* __restrict__ w_row  = w_d + kh * KW;
+                                const std::int64_t w_kh_off = w_kd_off + static_cast<std::int64_t>(kh) * KW;
 
                                 for (int kw = 0; kw < KW; ++kw) {
-                                    const float w = w_row[kw];
+                                    const float w0 = w_oc0[w_kh_off + kw];
+                                    const float w1 = w_oc1[w_kh_off + kw];
+                                    const float w2 = w_oc2[w_kh_off + kw];
+                                    const float w3 = w_oc3[w_kh_off + kw];
 
-                                    // For each output ow:
-                                    //   iw = ow * SW + (kw * DW - padLeftW)
-                                    //   valid when iw in [0, IW)
                                     const int iw_off = kw * DW - padLeftW;
                                     int owLo, owHi;
                                     if (SW <= 0) {
@@ -207,17 +230,22 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                                     }
 
                                     if (SW == 1) {
-                                        // Hot path for stride-1: contiguous load over
-                                        // in_row, contiguous store into rowAcc -- compiler
-                                        // auto-vectorizes the FMA.
                                         const float* __restrict__ src = in_row + iw_off;
                                         for (int ow = owLo; ow < owHi; ++ow) {
-                                            rowAcc[ow] += src[ow] * w;
+                                            const float v = src[ow];
+                                            acc0[ow] += v * w0;
+                                            acc1[ow] += v * w1;
+                                            acc2[ow] += v * w2;
+                                            acc3[ow] += v * w3;
                                         }
                                     } else {
                                         for (int ow = owLo; ow < owHi; ++ow) {
                                             const int iw = ow * SW + iw_off;
-                                            rowAcc[ow] += in_row[iw] * w;
+                                            const float v = in_row[iw];
+                                            acc0[ow] += v * w0;
+                                            acc1[ow] += v * w1;
+                                            acc2[ow] += v * w2;
+                                            acc3[ow] += v * w3;
                                         }
                                     }
                                 }
@@ -225,22 +253,29 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                         }
                     }
 
-                    float* __restrict__ out_row = out_oc_od + static_cast<std::int64_t>(oh) * OW;
-                    if (relu6) {
-                        for (int ow = 0; ow < OW; ++ow) {
-                            float v = rowAcc[ow];
-                            if (v < 0.0f) v = 0.0f;
-                            else if (v > 6.0f) v = 6.0f;
-                            out_row[ow] = v;
-                        }
-                    } else if (relu) {
-                        for (int ow = 0; ow < OW; ++ow) {
-                            float v = rowAcc[ow];
-                            out_row[ow] = v < 0.0f ? 0.0f : v;
-                        }
-                    } else {
-                        for (int ow = 0; ow < OW; ++ow) {
-                            out_row[ow] = rowAcc[ow];
+                    // Write back OC_BLOCK rows -- one per channel in the block.
+                    const float* const accs[OC_BLOCK] = {acc0, acc1, acc2, acc3};
+                    for (int ocb_in = 0; ocb_in < oc_n; ++ocb_in) {
+                        const int oc = oc_lo + ocb_in;
+                        const float* __restrict__ src = accs[ocb_in];
+                        float* __restrict__ out_row = out_n + oc * outStrideC
+                                                     + (static_cast<std::int64_t>(od) * OH + oh) * OW;
+                        if (relu6) {
+                            for (int ow = 0; ow < OW; ++ow) {
+                                float v = src[ow];
+                                if (v < 0.0f) v = 0.0f;
+                                else if (v > 6.0f) v = 6.0f;
+                                out_row[ow] = v;
+                            }
+                        } else if (relu) {
+                            for (int ow = 0; ow < OW; ++ow) {
+                                float v = src[ow];
+                                out_row[ow] = v < 0.0f ? 0.0f : v;
+                            }
+                        } else {
+                            for (int ow = 0; ow < OW; ++ow) {
+                                out_row[ow] = src[ow];
+                            }
                         }
                     }
                 }
