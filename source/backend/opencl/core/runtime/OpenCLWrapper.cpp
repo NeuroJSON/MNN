@@ -7,6 +7,21 @@
 //
 
 #include "backend/opencl/core/runtime/OpenCLWrapper.hpp"
+
+namespace MNN {
+// Definition of the thread-local last-CL-error tracker declared in
+// the header. Set by MNN_CHECK_CL_SUCCESS, read by callers that want
+// to abort on backend failure (e.g. siamize's MnnEngine).
+thread_local int gLastCLError = 0;
+}  // namespace MNN
+
+extern "C" int siam_mnn_get_last_cl_error() {
+    return MNN::gLastCLError;
+}
+extern "C" void siam_mnn_clear_last_cl_error() {
+    MNN::gLastCLError = 0;
+}
+
 #ifdef _WIN32
 #include <windows.h>
 #include <libloaderapi.h>

@@ -38,9 +38,28 @@
 
 #define MNN_CHECK_NOTNULL(X) MNN_ASSERT(X != NULL)
 
+// SIAM patch: MNN_CHECK_CL_SUCCESS originally only printed the error
+// and did NOT propagate it. That let CL_MEM_OBJECT_ALLOCATION_FAILURE
+// (-4) and similar leak silently while runSession() returned NO_ERROR
+// with a partly-corrupt output buffer. Tracking the last CL error in
+// a thread-local lets callers (e.g. siamize's MnnEngine::run_tile)
+// detect a backend allocation failure and abort instead of writing a
+// wrong labelmap to disk.
+//
+// The accessors are exported with C linkage + a `siam_` prefix so
+// callers don't need to include this internal MNN header (only the
+// .hpp/.cpp of MNN's OpenCL backend does). External consumers
+// declare them themselves; see siamize/src/engine_mnn.cpp.
+namespace MNN {
+extern thread_local int gLastCLError;
+}  // namespace MNN
+extern "C" int  siam_mnn_get_last_cl_error();
+extern "C" void siam_mnn_clear_last_cl_error();
+
 #define MNN_CHECK_CL_SUCCESS(error, info)                  \
     if (error != CL_SUCCESS) {                       \
         MNN_PRINT("CL ERROR CODE : %d, info:%s \n", (int)error, info); \
+        ::MNN::gLastCLError = (int)error;            \
     }
 #ifdef MNN_USE_LIB_WRAPPER
 
