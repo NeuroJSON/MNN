@@ -17,6 +17,7 @@
 #endif
 
 #include "backend/cpu/CPUBackend.hpp"
+#include "backend/cpu/compute/CommonOptFunction.h"
 #include "core/Concurrency.h"
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
@@ -114,6 +115,40 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
     const std::int64_t wStrideOC  = static_cast<std::int64_t>(IC) * KD * KH * KW;
     const std::int64_t wStrideIC  = static_cast<std::int64_t>(KD) * KH * KW;
     const std::int64_t wStrideKD  = static_cast<std::int64_t>(KH) * KW;
+
+    // MNN delivers Conv3D activations in NC4HW4 (channels packed by 4 in the
+    // innermost dim), but the GEMM below indexes a plain NCDHW buffer. Unpack
+    // input to NCDHW scratch, compute into NCDHW scratch, then pack the result
+    // back to NC4HW4. When the tensors are already plain NCHW (e.g. a different
+    // schedule) the host pointers are used directly with no copy.
+    std::vector<float> inScratch, outScratch;
+    const bool packedNC4 =
+        (TensorUtils::getDescribe(in)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4);
+    if (packedNC4) {
+        const int areaIn = static_cast<int>(inStrideC);
+        inScratch.resize(static_cast<size_t>(N) * IC * areaIn);
+        outScratch.resize(static_cast<size_t>(N) * OC * static_cast<size_t>(outStrideC));
+        int offIn[2] = {areaIn, areaIn};
+        for (int n = 0; n < N; ++n) {
+            MNNUnpackC4(inScratch.data() + static_cast<size_t>(n) * IC * areaIn,
+                        in->host<float>() + static_cast<size_t>(n) * in->stride(0),
+                        static_cast<size_t>(areaIn), static_cast<size_t>(IC), offIn);
+        }
+        inputData  = inScratch.data();
+        outputData = outScratch.data();
+    }
+    const auto packResultBack = [&]() {
+        if (!packedNC4) {
+            return;
+        }
+        const int areaOut = static_cast<int>(outStrideC);
+        int offOut[2] = {areaOut, areaOut};
+        for (int n = 0; n < N; ++n) {
+            MNNPackC4(out->host<float>() + static_cast<size_t>(n) * out->stride(0),
+                      outScratch.data() + static_cast<size_t>(n) * OC * areaOut,
+                      static_cast<size_t>(areaOut), static_cast<size_t>(OC), offOut);
+        }
+    };
 
     auto cpuBackend = static_cast<CPUBackend*>(backend());
     const int threadNumber = std::max(1, cpuBackend->threadNumber());
@@ -267,6 +302,7 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
             }
             MNN_CONCURRENCY_END();
         }
+        packResultBack();
         return NO_ERROR;
     }
 #endif  // MNN_CONV3D_AVX2
@@ -413,6 +449,7 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
         MNN_CONCURRENCY_END();
     }
 
+    packResultBack();
     return NO_ERROR;
 }
 
