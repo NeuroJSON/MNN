@@ -40,6 +40,8 @@ private:
     bool mRelu  = false;
     bool mRelu6 = false;
     std::vector<float> mWeight;  // ConvTranspose3D weight: [IC, OC, KD, KH, KW]
+    std::vector<float> mWeightT; // transposed to [OC, IC, KD, KH, KW] for the
+                                 // gather-GEMM fast path (built lazily)
     std::vector<float> mBias;    // [OC]
 };
 

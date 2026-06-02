@@ -11,6 +11,11 @@
 #include <cstdint>
 #include <vector>
 
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#define MNN_CONV3D_AVX2 1
+#endif
+
 #include "backend/cpu/CPUBackend.hpp"
 #include "core/Concurrency.h"
 #include "core/Macro.h"
@@ -141,6 +146,130 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
     // register spills. The partial-block path is kept for other models.
     constexpr int OC_BLOCK = 4;
     const int ocBlocks = (OC + OC_BLOCK - 1) / OC_BLOCK;
+
+#ifdef MNN_CONV3D_AVX2
+    // ---- im2col + register-blocked AVX2 GEMM (unit-stride W) ---------------
+    // The direct-conv path below re-reads the input activation once per
+    // output-channel block; at the high-resolution stages (activations far
+    // exceed cache) that makes it DRAM-bandwidth bound. Here we im2col each
+    // 16-wide output panel ONCE into a small column buffer and reuse it across
+    // ALL output channels (a GEMM B-panel), and keep the C tile (4 oc x 16)
+    // in __m256 registers across the L=IC*KD*KH*KW reduction. Weights are
+    // already laid out [OC][L] row-major (= MNN's Convolution3D weight order),
+    // so no repacking is needed. Parallelized over output rows (od,oh).
+    if (SW == 1) {
+        const int L = static_cast<int>(wStrideOC);  // IC*KD*KH*KW
+        constexpr int EP = 16;
+
+        const auto applyStore = [&](float* __restrict__ dst, __m256 lo, __m256 hi, int ep) {
+            alignas(32) float tmp[EP];
+            _mm256_store_ps(tmp, lo);
+            _mm256_store_ps(tmp + 8, hi);
+            if (relu6) {
+                for (int e = 0; e < ep; ++e) { float v = tmp[e]; v = v < 0.f ? 0.f : (v > 6.f ? 6.f : v); dst[e] = v; }
+            } else if (relu) {
+                for (int e = 0; e < ep; ++e) { float v = tmp[e]; dst[e] = v < 0.f ? 0.f : v; }
+            } else {
+                for (int e = 0; e < ep; ++e) dst[e] = tmp[e];
+            }
+        };
+
+        for (int n = 0; n < N; ++n) {
+            const float* __restrict__ in_n  = inputData + n * inStrideN;
+            float*       __restrict__ out_n = outputData + n * outStrideN;
+            const int rows = OD * OH;
+
+            MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
+                std::vector<float> acolBuf(static_cast<size_t>(L) * EP);
+                float* const acol = acolBuf.data();
+
+                for (int r = static_cast<int>(tId); r < rows; r += threadNumber) {
+                    const int od = r / OH;
+                    const int oh = r % OH;
+
+                    int kdLo = 0, kdHi = KD;
+                    { const int id0 = od * SD - padFrontD;
+                      while (kdLo < KD && id0 + kdLo * DD < 0) ++kdLo;
+                      while (kdHi > kdLo && id0 + (kdHi - 1) * DD >= ID) --kdHi; }
+                    int khLo = 0, khHi = KH;
+                    { const int ih0 = oh * SH - padTopH;
+                      while (khLo < KH && ih0 + khLo * DH < 0) ++khLo;
+                      while (khHi > khLo && ih0 + (khHi - 1) * DH >= IH) --khHi; }
+
+                    const std::int64_t outBase = (static_cast<std::int64_t>(od) * OH + oh) * OW;
+
+                    for (int ow0 = 0; ow0 < OW; ow0 += EP) {
+                        const int ep = std::min(EP, OW - ow0);
+
+                        // im2col this panel once (zero-padded for out-of-range taps/edges)
+                        std::memset(acol, 0, static_cast<size_t>(L) * EP * sizeof(float));
+                        for (int ic = 0; ic < IC; ++ic) {
+                            const float* __restrict__ in_ic = in_n + static_cast<std::int64_t>(ic) * inStrideC;
+                            for (int kd = kdLo; kd < kdHi; ++kd) {
+                                const int id = od * SD - padFrontD + kd * DD;
+                                const float* __restrict__ in_d = in_ic + static_cast<std::int64_t>(id) * IH * IW;
+                                for (int kh = khLo; kh < khHi; ++kh) {
+                                    const int ih = oh * SH - padTopH + kh * DH;
+                                    const float* __restrict__ in_row = in_d + static_cast<std::int64_t>(ih) * IW;
+                                    for (int kw = 0; kw < KW; ++kw) {
+                                        const int l = ((ic * KD + kd) * KH + kh) * KW + kw;
+                                        float* __restrict__ arow = acol + static_cast<size_t>(l) * EP;
+                                        const int iw_base = ow0 + kw * DW - padLeftW;  // SW==1
+                                        int eLo = -iw_base; if (eLo < 0) eLo = 0;
+                                        int eHi = IW - iw_base; if (eHi > ep) eHi = ep;
+                                        for (int e = eLo; e < eHi; ++e) arow[e] = in_row[iw_base + e];
+                                    }
+                                }
+                            }
+                        }
+
+                        // GEMM: C[oc][ep] = bias + sum_l W[oc][l] * acol[l][e]
+                        int oc = 0;
+                        for (; oc + 4 <= OC; oc += 4) {
+                            const float* __restrict__ wq0 = weightData + static_cast<std::int64_t>(oc + 0) * wStrideOC;
+                            const float* __restrict__ wq1 = weightData + static_cast<std::int64_t>(oc + 1) * wStrideOC;
+                            const float* __restrict__ wq2 = weightData + static_cast<std::int64_t>(oc + 2) * wStrideOC;
+                            const float* __restrict__ wq3 = weightData + static_cast<std::int64_t>(oc + 3) * wStrideOC;
+                            __m256 c00 = _mm256_set1_ps(biasData[oc + 0]), c01 = c00;
+                            __m256 c10 = _mm256_set1_ps(biasData[oc + 1]), c11 = c10;
+                            __m256 c20 = _mm256_set1_ps(biasData[oc + 2]), c21 = c20;
+                            __m256 c30 = _mm256_set1_ps(biasData[oc + 3]), c31 = c30;
+                            for (int l = 0; l < L; ++l) {
+                                const float* __restrict__ arow = acol + static_cast<size_t>(l) * EP;
+                                const __m256 a0 = _mm256_loadu_ps(arow);
+                                const __m256 a1 = _mm256_loadu_ps(arow + 8);
+                                __m256 w = _mm256_set1_ps(wq0[l]); c00 = _mm256_fmadd_ps(a0, w, c00); c01 = _mm256_fmadd_ps(a1, w, c01);
+                                w = _mm256_set1_ps(wq1[l]); c10 = _mm256_fmadd_ps(a0, w, c10); c11 = _mm256_fmadd_ps(a1, w, c11);
+                                w = _mm256_set1_ps(wq2[l]); c20 = _mm256_fmadd_ps(a0, w, c20); c21 = _mm256_fmadd_ps(a1, w, c21);
+                                w = _mm256_set1_ps(wq3[l]); c30 = _mm256_fmadd_ps(a0, w, c30); c31 = _mm256_fmadd_ps(a1, w, c31);
+                            }
+                            applyStore(out_n + static_cast<std::int64_t>(oc + 0) * outStrideC + outBase + ow0, c00, c01, ep);
+                            applyStore(out_n + static_cast<std::int64_t>(oc + 1) * outStrideC + outBase + ow0, c10, c11, ep);
+                            applyStore(out_n + static_cast<std::int64_t>(oc + 2) * outStrideC + outBase + ow0, c20, c21, ep);
+                            applyStore(out_n + static_cast<std::int64_t>(oc + 3) * outStrideC + outBase + ow0, c30, c31, ep);
+                        }
+                        for (; oc < OC; ++oc) {  // oc tail (OC % 4)
+                            const float* __restrict__ wq = weightData + static_cast<std::int64_t>(oc) * wStrideOC;
+                            alignas(32) float c[EP];
+                            for (int e = 0; e < ep; ++e) c[e] = biasData[oc];
+                            for (int l = 0; l < L; ++l) {
+                                const float wl = wq[l];
+                                const float* __restrict__ arow = acol + static_cast<size_t>(l) * EP;
+                                for (int e = 0; e < ep; ++e) c[e] += arow[e] * wl;
+                            }
+                            float* __restrict__ dst = out_n + static_cast<std::int64_t>(oc) * outStrideC + outBase + ow0;
+                            if (relu6) { for (int e = 0; e < ep; ++e) { float v = c[e]; v = v < 0.f ? 0.f : (v > 6.f ? 6.f : v); dst[e] = v; } }
+                            else if (relu) { for (int e = 0; e < ep; ++e) { float v = c[e]; dst[e] = v < 0.f ? 0.f : v; } }
+                            else { for (int e = 0; e < ep; ++e) dst[e] = c[e]; }
+                        }
+                    }
+                }
+            }
+            MNN_CONCURRENCY_END();
+        }
+        return NO_ERROR;
+    }
+#endif  // MNN_CONV3D_AVX2
 
     for (int n = 0; n < N; ++n) {
         const float* __restrict__ in_n  = inputData + n * inStrideN;
