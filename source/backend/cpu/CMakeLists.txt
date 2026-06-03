@@ -10,7 +10,13 @@ add_library(MNNCPU OBJECT ${MNN_CPU_SRC})
 # Native 3D convolution executors: the hot inner loops benefit
 # significantly from AVX2 + FMA (8-wide SIMD) vs the SSE4.1 default.
 # Apply per-file so the rest of MNNCPU stays SSE-compatible.
-if (MNN_USE_SSE AND MNN_AVX2)
+#
+# Gate on the target being x86: MNN_USE_SSE / MNN_AVX2 default ON even on
+# arm64 (e.g. Apple Silicon), where -mavx2/-mfma are invalid options and
+# /arch:AVX2 is meaningless. On non-x86 the Conv3D sources compile their
+# scalar fallback (CPUConvolution3D.cpp guards the AVX2 path behind
+# __AVX2__ && __FMA__), so no flags are needed there.
+if (MNN_USE_SSE AND MNN_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|x86|i[3-6]86")
     if(NOT MSVC)
         set_source_files_properties(
             "${CMAKE_CURRENT_LIST_DIR}/CPUConvolution3D.cpp"

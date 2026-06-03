@@ -436,7 +436,11 @@ public:
             axis = axisTensor->host<int>()[0];
         }
         auto D  = data->buffer().dimensions;
-        auto N  = indices->elementSize();
+        // elementSize() is size_t; createDevice<int>({N}) / {N, D} below take
+        // an initializer_list<int>, so keep N an int to avoid a narrowing
+        // conversion (a hard error under clang's -Wc++11-narrowing and MSVC
+        // C2398; GCC only warns). Index counts here fit in int.
+        int  N  = static_cast<int>(indices->elementSize());
         if (axis < 0) {
             axis = D + axis;
         }
