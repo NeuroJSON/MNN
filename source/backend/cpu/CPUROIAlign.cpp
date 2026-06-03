@@ -40,7 +40,9 @@ ErrorCode CPUROIAlign::onResize(const std::vector<Tensor*>& inputs, const std::v
     TensorUtils::setLinearLayout(&mROI);
     auto core    = static_cast<CPUBackend*>(backend())->functions();
     if (core->bytes < 4) {
-        mROITemp.reset(MNN::Tensor::createDevice<int32_t>({mROI.elementSize()}));
+        // elementSize() is size_t; createDevice<int32_t>({...}) takes an
+        // initializer_list<int>, a narrowing conversion clang/MSVC reject.
+        mROITemp.reset(MNN::Tensor::createDevice<int32_t>({static_cast<int>(mROI.elementSize())}));
     }
     auto res = backend()->onAcquireBuffer(&mROI, Backend::DYNAMIC);
     if (!res) {

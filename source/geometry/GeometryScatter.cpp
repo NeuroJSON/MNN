@@ -221,7 +221,11 @@ public:
             axis = inputs[3]->host<int>()[0];
         }
         auto D  = data->buffer().dimensions;
-        auto N  = indices->elementSize();
+        // elementSize() is size_t; createDevice<int>({N}) / {N, D} below take
+        // an initializer_list<int>, a narrowing conversion that clang
+        // (-Wc++11-narrowing) and MSVC (C2398) reject as a hard error (GCC
+        // only warns). Keep N an int (buildScatterND also takes int N).
+        int  N  = static_cast<int>(indices->elementSize());
         if (axis < 0) {
             axis = D + axis;
         }
