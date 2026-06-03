@@ -102,10 +102,10 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
         padLeftW  = needW / 2;
     }
 
-    const float* __restrict__ inputData  = in->host<float>();
-    float*       __restrict__ outputData = out->host<float>();
-    const float* __restrict__ weightData = mWeight.data();
-    const float* __restrict__ biasData   = mBias.data();
+    const float* __restrict inputData  = in->host<float>();
+    float*       __restrict outputData = out->host<float>();
+    const float* __restrict weightData = mWeight.data();
+    const float* __restrict biasData   = mBias.data();
     const bool relu  = mRelu;
     const bool relu6 = mRelu6;
 
@@ -187,10 +187,10 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                         mWeightT[static_cast<size_t>(oc) * L + ic * KS + t] =
                             weightData[static_cast<size_t>(ic) * wStrideIC + oc * wStrideOC + t];
         }
-        const float* __restrict__ Wt = mWeightT.data();
+        const float* __restrict Wt = mWeightT.data();
         constexpr int EP = 16;
 
-        const auto applyStore = [&](float* __restrict__ dst, __m256 lo, __m256 hi, int ep) {
+        const auto applyStore = [&](float* __restrict dst, __m256 lo, __m256 hi, int ep) {
             alignas(32) float tmp[EP];
             _mm256_store_ps(tmp, lo);
             _mm256_store_ps(tmp + 8, hi);
@@ -200,8 +200,8 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
         };
 
         for (int n = 0; n < N; ++n) {
-            const float* __restrict__ in_n  = inputData + n * inStrideN;
-            float*       __restrict__ out_n = outputData + n * outStrideN;
+            const float* __restrict in_n  = inputData + n * inStrideN;
+            float*       __restrict out_n = outputData + n * outStrideN;
             const int rows = OD * OH;
 
             MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
@@ -231,7 +231,7 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
 
                     if (nKd == 0 || nKh == 0) {  // no input contributes: bias only
                         for (int oc = 0; oc < OC; ++oc) {
-                            float* __restrict__ dst = out_n + static_cast<std::int64_t>(oc) * outStrideC + outBase;
+                            float* __restrict dst = out_n + static_cast<std::int64_t>(oc) * outStrideC + outBase;
                             float b = biasData[oc];
                             b = relu6 ? (b < 0.f ? 0.f : (b > 6.f ? 6.f : b)) : (relu ? (b < 0.f ? 0.f : b) : b);
                             for (int ow = 0; ow < OW; ++ow) dst[ow] = b;
@@ -243,19 +243,19 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                         const int ep = std::min(EP, OW - ow0);
                         std::memset(acol, 0, static_cast<size_t>(L) * EP * sizeof(float));
                         for (int ic = 0; ic < IC; ++ic) {
-                            const float* __restrict__ in_ic = in_n + static_cast<std::int64_t>(ic) * inStrideC;
+                            const float* __restrict in_ic = in_n + static_cast<std::int64_t>(ic) * inStrideC;
                             for (int jd = 0; jd < nKd; ++jd) {
-                                const float* __restrict__ in_d = in_ic + static_cast<std::int64_t>(vId[jd]) * IH * IW;
+                                const float* __restrict in_d = in_ic + static_cast<std::int64_t>(vId[jd]) * IH * IW;
                                 for (int jh = 0; jh < nKh; ++jh) {
-                                    const float* __restrict__ in_row = in_d + static_cast<std::int64_t>(vIh[jh]) * IW;
+                                    const float* __restrict in_row = in_d + static_cast<std::int64_t>(vIh[jh]) * IW;
                                     for (int kw = 0; kw < KW; ++kw) {
                                         const int l = ((ic * KD + vKd[jd]) * KH + vKh[jh]) * KW + kw;
-                                        float* __restrict__ arow = acol + static_cast<size_t>(l) * EP;
+                                        float* __restrict arow = acol + static_cast<size_t>(l) * EP;
                                         const int owoff = kw * DW - padLeftW;  // iwNum = (ow0+e) - owoff
                                         if (SW == 1) {
                                             int eLo = owoff - ow0; if (eLo < 0) eLo = 0;
                                             int eHi = IW + owoff - ow0; if (eHi > ep) eHi = ep;
-                                            const float* __restrict__ src = in_row - owoff;
+                                            const float* __restrict src = in_row - owoff;
                                             for (int e = eLo; e < eHi; ++e) arow[e] = src[ow0 + e];
                                         } else {
                                             for (int e = 0; e < ep; ++e) {
@@ -273,10 +273,10 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
 
                         int oc = 0;
                         for (; oc + 4 <= OC; oc += 4) {
-                            const float* __restrict__ w0 = Wt + static_cast<std::int64_t>(oc + 0) * L;
-                            const float* __restrict__ w1 = Wt + static_cast<std::int64_t>(oc + 1) * L;
-                            const float* __restrict__ w2 = Wt + static_cast<std::int64_t>(oc + 2) * L;
-                            const float* __restrict__ w3 = Wt + static_cast<std::int64_t>(oc + 3) * L;
+                            const float* __restrict w0 = Wt + static_cast<std::int64_t>(oc + 0) * L;
+                            const float* __restrict w1 = Wt + static_cast<std::int64_t>(oc + 1) * L;
+                            const float* __restrict w2 = Wt + static_cast<std::int64_t>(oc + 2) * L;
+                            const float* __restrict w3 = Wt + static_cast<std::int64_t>(oc + 3) * L;
                             __m256 c00 = _mm256_set1_ps(biasData[oc + 0]), c01 = c00;
                             __m256 c10 = _mm256_set1_ps(biasData[oc + 1]), c11 = c10;
                             __m256 c20 = _mm256_set1_ps(biasData[oc + 2]), c21 = c20;
@@ -286,7 +286,7 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                                     for (int jh = 0; jh < nKh; ++jh) {
                                         for (int kw = 0; kw < KW; ++kw) {
                                             const int l = ((ic * KD + vKd[jd]) * KH + vKh[jh]) * KW + kw;
-                                            const float* __restrict__ arow = acol + static_cast<size_t>(l) * EP;
+                                            const float* __restrict arow = acol + static_cast<size_t>(l) * EP;
                                             const __m256 a0 = _mm256_loadu_ps(arow);
                                             const __m256 a1 = _mm256_loadu_ps(arow + 8);
                                             __m256 w = _mm256_set1_ps(w0[l]); c00 = _mm256_fmadd_ps(a0, w, c00); c01 = _mm256_fmadd_ps(a1, w, c01);
@@ -303,7 +303,7 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                             applyStore(out_n + static_cast<std::int64_t>(oc + 3) * outStrideC + outBase + ow0, c30, c31, ep);
                         }
                         for (; oc < OC; ++oc) {
-                            const float* __restrict__ w = Wt + static_cast<std::int64_t>(oc) * L;
+                            const float* __restrict w = Wt + static_cast<std::int64_t>(oc) * L;
                             alignas(32) float c[EP];
                             for (int e = 0; e < ep; ++e) c[e] = biasData[oc];
                             for (int ic = 0; ic < IC; ++ic)
@@ -312,10 +312,10 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                                         for (int kw = 0; kw < KW; ++kw) {
                                             const int l = ((ic * KD + vKd[jd]) * KH + vKh[jh]) * KW + kw;
                                             const float wl = w[l];
-                                            const float* __restrict__ arow = acol + static_cast<size_t>(l) * EP;
+                                            const float* __restrict arow = acol + static_cast<size_t>(l) * EP;
                                             for (int e = 0; e < ep; ++e) c[e] += arow[e] * wl;
                                         }
-                            float* __restrict__ dst = out_n + static_cast<std::int64_t>(oc) * outStrideC + outBase + ow0;
+                            float* __restrict dst = out_n + static_cast<std::int64_t>(oc) * outStrideC + outBase + ow0;
                             if (relu6) { for (int e = 0; e < ep; ++e) { float v = c[e]; v = v < 0.f ? 0.f : (v > 6.f ? 6.f : v); dst[e] = v; } }
                             else if (relu) { for (int e = 0; e < ep; ++e) { float v = c[e]; dst[e] = v < 0.f ? 0.f : v; } }
                             else { for (int e = 0; e < ep; ++e) dst[e] = c[e]; }
@@ -331,8 +331,8 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
 #endif  // MNN_DECONV3D_AVX2
 
     for (int n = 0; n < N; ++n) {
-        const float* __restrict__ in_n  = inputData + n * inStrideN;
-        float*       __restrict__ out_n = outputData + n * outStrideN;
+        const float* __restrict in_n  = inputData + n * inStrideN;
+        float*       __restrict out_n = outputData + n * outStrideN;
 
         MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
             std::vector<float> rowAcc(static_cast<size_t>(OW), 0.0f);
@@ -365,7 +365,7 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                     --kdHi;
                 }
 
-                float*       __restrict__ out_oc_od = out_n + oc * outStrideC
+                float*       __restrict out_oc_od = out_n + oc * outStrideC
                                                      + static_cast<std::int64_t>(od) * OH * OW;
                 const float  bias = biasData[oc];
 
@@ -391,8 +391,8 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                     }
 
                     for (int ic = 0; ic < IC; ++ic) {
-                        const float* __restrict__ in_ic_n = in_n + ic * inStrideC;
-                        const float* __restrict__ w_ic_oc = weightData
+                        const float* __restrict in_ic_n = in_n + ic * inStrideC;
+                        const float* __restrict w_ic_oc = weightData
                                                              + ic * wStrideIC
                                                              + oc * wStrideOC;
 
@@ -401,18 +401,18 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                             if (idNum < 0 || (idNum % SD) != 0) continue;
                             const int id = idNum / SD;
                             if (id < 0 || id >= ID) continue;
-                            const float* __restrict__ in_d = in_ic_n
+                            const float* __restrict in_d = in_ic_n
                                                              + static_cast<std::int64_t>(id) * IH * IW;
-                            const float* __restrict__ w_d  = w_ic_oc + kd * wStrideKD;
+                            const float* __restrict w_d  = w_ic_oc + kd * wStrideKD;
 
                             for (int kh = khLo; kh < khHi; ++kh) {
                                 const int ihNum = oh + padTopH - kh * DH;
                                 if (ihNum < 0 || (ihNum % SH) != 0) continue;
                                 const int ih = ihNum / SH;
                                 if (ih < 0 || ih >= IH) continue;
-                                const float* __restrict__ in_row = in_d
+                                const float* __restrict in_row = in_d
                                                                    + static_cast<std::int64_t>(ih) * IW;
-                                const float* __restrict__ w_row  = w_d + kh * KW;
+                                const float* __restrict w_row  = w_d + kh * KW;
 
                                 for (int kw = 0; kw < KW; ++kw) {
                                     const float w = w_row[kw];
@@ -436,7 +436,7 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
 
                                     if (SW == 1) {
                                         // iw = ow - ow_off, contiguous
-                                        const float* __restrict__ src = in_row - ow_off;
+                                        const float* __restrict src = in_row - ow_off;
                                         for (int ow = owLo; ow < owHi; ++ow) {
                                             rowAcc[ow] += src[ow] * w;
                                         }
@@ -454,7 +454,7 @@ ErrorCode CPUDeconvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                         }
                     }
 
-                    float* __restrict__ out_row = out_oc_od + static_cast<std::int64_t>(oh) * OW;
+                    float* __restrict out_row = out_oc_od + static_cast<std::int64_t>(oh) * OW;
                     if (relu6) {
                         for (int ow = 0; ow < OW; ++ow) {
                             float v = rowAcc[ow];
