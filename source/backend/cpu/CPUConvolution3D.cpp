@@ -419,7 +419,11 @@ ErrorCode CPUConvolution3D::onExecute(const std::vector<Tensor*>& inputs,
                     }
 
                     // Write back OC_BLOCK rows -- one per channel in the block.
-                    const float* const accs[OC_BLOCK] = {acc0, acc1, acc2, acc3};
+                    // Literal bound (OC_BLOCK == 4): MSVC won't accept the
+                    // constexpr local OC_BLOCK as a constant array bound inside
+                    // the MNN_CONCURRENCY parallel region (C2131); a literal is
+                    // unambiguously constant for every compiler.
+                    const float* const accs[4] = {acc0, acc1, acc2, acc3};
                     for (int ocb_in = 0; ocb_in < oc_n; ++ocb_in) {
                         const int oc = oc_lo + ocb_in;
                         const float* __restrict src = accs[ocb_in];
