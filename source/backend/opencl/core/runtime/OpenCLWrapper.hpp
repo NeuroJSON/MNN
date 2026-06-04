@@ -53,8 +53,12 @@
 namespace MNN {
 extern thread_local int gLastCLError;
 }  // namespace MNN
-extern "C" int  siam_mnn_get_last_cl_error();
-extern "C" void siam_mnn_clear_last_cl_error();
+// MNN_PUBLIC (visibility=default / dllexport) so these stay linkable when MNN
+// is built as a shared library: MNN compiles with -fvisibility=hidden, which
+// would otherwise hide them in libMNN.so/.dylib and break siamize's link
+// (a static libMNN.a exposes them regardless). Empty on a static MSVC build.
+extern "C" MNN_PUBLIC int  siam_mnn_get_last_cl_error();
+extern "C" MNN_PUBLIC void siam_mnn_clear_last_cl_error();
 
 #define MNN_CHECK_CL_SUCCESS(error, info)                  \
     if (error != CL_SUCCESS) {                       \
