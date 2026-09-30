@@ -386,5 +386,9 @@ mMaps.insert(std::make_pair("glsl_dynamic_quant_reduce_minmax_comp", std::make_p
 mMaps.insert(std::make_pair("glsl_dynamic_quant_reduce_minmax_FP16_comp", std::make_pair(glsl_dynamic_quant_reduce_minmax_FP16_comp,glsl_dynamic_quant_reduce_minmax_FP16_comp_len)));
 mMaps.insert(std::make_pair("glsl_conv3d_comp", std::make_pair(glsl_conv3d_comp,glsl_conv3d_comp_len)));
 mMaps.insert(std::make_pair("glsl_conv3d_FP16_comp", std::make_pair(glsl_conv3d_FP16_comp,glsl_conv3d_FP16_comp_len)));
+mMaps.insert(std::make_pair("glsl_norm_split_comp", std::make_pair(glsl_norm_split_comp,glsl_norm_split_comp_len)));
+mMaps.insert(std::make_pair("glsl_norm_split_LAYERNORM_SCALE_comp", std::make_pair(glsl_norm_split_LAYERNORM_SCALE_comp,glsl_norm_split_LAYERNORM_SCALE_comp_len)));
+mMaps.insert(std::make_pair("glsl_norm_split_FP16_comp", std::make_pair(glsl_norm_split_FP16_comp,glsl_norm_split_FP16_comp_len)));
+mMaps.insert(std::make_pair("glsl_norm_split_LAYERNORM_SCALE_FP16_comp", std::make_pair(glsl_norm_split_LAYERNORM_SCALE_FP16_comp,glsl_norm_split_LAYERNORM_SCALE_FP16_comp_len)));
 }
 }

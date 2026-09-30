@@ -481,5 +481,11 @@
     },
     "conv3d.comp": {
         "useFP16": true
+    },
+    "norm_split.comp": {
+        "useFP16": true,
+        "macro": [
+            "LAYERNORM_SCALE"
+        ]
     }
 }

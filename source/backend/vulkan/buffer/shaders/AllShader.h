@@ -766,4 +766,12 @@ extern const unsigned char glsl_conv3d_comp[];
 extern unsigned int glsl_conv3d_comp_len;
 extern const unsigned char glsl_conv3d_FP16_comp[];
 extern unsigned int glsl_conv3d_FP16_comp_len;
+extern const unsigned char glsl_norm_split_comp[];
+extern unsigned int glsl_norm_split_comp_len;
+extern const unsigned char glsl_norm_split_LAYERNORM_SCALE_comp[];
+extern unsigned int glsl_norm_split_LAYERNORM_SCALE_comp_len;
+extern const unsigned char glsl_norm_split_FP16_comp[];
+extern unsigned int glsl_norm_split_FP16_comp_len;
+extern const unsigned char glsl_norm_split_LAYERNORM_SCALE_FP16_comp[];
+extern unsigned int glsl_norm_split_LAYERNORM_SCALE_FP16_comp_len;
 #endif

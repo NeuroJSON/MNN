@@ -1,0 +1,105 @@
+// Split-row LayerNorm for few, very long rows (e.g. InstanceNorm on a 3D volume
+// reshaped to (1, C, D*H*W): 32 rows of 4.7M values). norm_opt.comp runs one
+// 64-invocation work-group per row, which leaves most of a large GPU idle.
+// One shader, three pipelines (STAGE specialization constant), dispatched in
+// order with buffer barriers in between:
+//   STAGE 0  one work-group per (chunk, row): chunk count, mean and M2 (sum of
+//            squared deviations from the chunk mean)
+//   STAGE 1  one invocation per row: merge the chunks (Chan et al.) into the
+//            row mean and 1/sqrt(var + eps)
+//   STAGE 2  one invocation per vec4 of the output
+// Requires inside % 4 == 0. uConstant.size = (inside4, rows, chunk4, chunks).
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 3) const uint USE_RMS = 0;
+layout(constant_id = 4) const int STAGE = 0;
+
+layout(set = 0, binding = 0) writeonly buffer s0 { FLOAT4 data[]; } uOutput;
+layout(set = 0, binding = 1) readonly buffer s1 { FLOAT4 data[]; } uInput;
+layout(set = 0, binding = 2) readonly uniform constBuffer {
+    ivec4 size;
+    float eps;
+} uConstant;
+layout(set = 0, binding = 3) buffer s2 { float data[]; } uStats;  // per (row, chunk): n, mean, M2
+layout(set = 0, binding = 4) buffer s3 { float data[]; } uRow;    // per row: mean, 1/sqrt(var + eps)
+#ifdef LAYERNORM_SCALE
+layout(set = 0, binding = 5) readonly buffer s4 { FLOAT4 data[]; } uGamma;
+layout(set = 0, binding = 6) readonly buffer s5 { FLOAT4 data[]; } uBeta;
+#endif
+
+shared float red[256];  // >= the local size the host specializes (256)
+
+float groupSum(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const int inside4 = uConstant.size.x;
+    const int rows    = uConstant.size.y;
+    const int chunk4  = uConstant.size.z;
+    const int chunks  = uConstant.size.w;
+    if (STAGE == 0) {
+        const int chunk = int(gl_WorkGroupID.x);
+        const int row   = int(gl_WorkGroupID.y);
+        const int begin = chunk * chunk4;
+        const int end   = min(begin + chunk4, inside4);
+        const int base  = row * inside4;
+        const int step  = int(gl_WorkGroupSize.x);
+        const float n = float((end - begin) * 4);
+        float mean = 0.0;
+        if (USE_RMS == 0u) {
+            vec4 s = vec4(0.0);
+            for (int i = begin + int(gl_LocalInvocationID.x); i < end; i += step) {
+                s += vec4(uInput.data[base + i]);
+            }
+            mean = groupSum(s.x + s.y + s.z + s.w) / n;
+        }
+        vec4 q = vec4(0.0);
+        for (int i = begin + int(gl_LocalInvocationID.x); i < end; i += step) {
+            const vec4 d = vec4(uInput.data[base + i]) - vec4(mean);
+            q += d * d;
+        }
+        const float m2 = groupSum(q.x + q.y + q.z + q.w);
+        if (gl_LocalInvocationID.x == 0) {
+            const int o = (row * chunks + chunk) * 3;
+            uStats.data[o]     = n;
+            uStats.data[o + 1] = mean;
+            uStats.data[o + 2] = m2;
+        }
+    } else if (STAGE == 1) {
+        const int row = int(gl_GlobalInvocationID.x);
+        if (row >= rows) return;
+        float n = 0.0, mean = 0.0, m2 = 0.0;
+        for (int c = 0; c < chunks; ++c) {
+            const int o = (row * chunks + c) * 3;
+            const float nb = uStats.data[o], mb = uStats.data[o + 1], m2b = uStats.data[o + 2];
+            const float tot = n + nb;
+            const float delta = mb - mean;
+            mean += delta * (nb / tot);
+            m2 += m2b + delta * delta * (n * nb / tot);
+            n = tot;
+        }
+        uRow.data[row * 2]     = mean;
+        uRow.data[row * 2 + 1] = inversesqrt(m2 / n + uConstant.eps);
+    } else {
+        const int x = int(gl_GlobalInvocationID.x);
+        const int row = int(gl_GlobalInvocationID.y);
+        if (x >= inside4 || row >= rows) return;
+        const float mean = uRow.data[row * 2];
+        const float r = uRow.data[row * 2 + 1];
+        vec4 v = (vec4(uInput.data[row * inside4 + x]) - vec4(mean)) * r;
+#ifdef LAYERNORM_SCALE
+        v = v * vec4(uGamma.data[x]) + vec4(uBeta.data[x]);
+#endif
+        uOutput.data[row * inside4 + x] = FLOAT4(v);
+    }
+}
