@@ -208,7 +208,7 @@ ErrorCode VulkanRaster::onEncode(const std::vector<Tensor *> &____inputs, const 
 
     // Can't use fast mode, create temp buffer
     if (des->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
-        int bufferSize = (output->getType().code == halide_type_float && vkBn->useFP16()) ? 
+        size_t bufferSize = (output->getType().code == halide_type_float && vkBn->useFP16()) ? 
                          sizeof(uint16_t) : sizeof(float);
         for (int i=0; i<output->dimensions(); ++i) {
             bufferSize *= output->length(i);
@@ -228,7 +228,7 @@ ErrorCode VulkanRaster::onEncode(const std::vector<Tensor *> &____inputs, const 
             continue;
         }
         MNN_ASSERT(origin->deviceId() != 0);
-        int bufferSize = (output->getType().code == halide_type_float && vkBn->useFP16()) ? 
+        size_t bufferSize = (output->getType().code == halide_type_float && vkBn->useFP16()) ? 
                          sizeof(uint16_t) : sizeof(float);
         for (int i=0; i<origin->dimensions(); ++i) {
             bufferSize *= origin->length(i);

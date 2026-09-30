@@ -9,12 +9,19 @@
 #include "VulkanMemoryPool.hpp"
 namespace MNN {
 VulkanMemory::VulkanMemory(const VulkanDevice& dev, const VkMemoryAllocateInfo& info) : mDevice(dev) {
-    CALL_VK(mDevice.allocMemory(mMemory, info));
+    // Out-of-memory is an expected, recoverable failure (large 3D inputs):
+    // leave mMemory null so the caller can report OUT_OF_MEMORY instead of
+    // binding a null allocation (CALL_VK's assert is compiled out in Release).
+    if (VK_SUCCESS != mDevice.allocMemory(mMemory, info)) {
+        mMemory = VK_NULL_HANDLE;
+    }
     mTypeIndex = info.memoryTypeIndex;
     mSize      = info.allocationSize;
 }
 VulkanMemory::~VulkanMemory() {
-    mDevice.freeMemory(mMemory);
+    if (VK_NULL_HANDLE != mMemory) {
+        mDevice.freeMemory(mMemory);
+    }
 }
 
 class VulkanAllocator : public BufferAllocator::Allocator {
@@ -32,6 +39,10 @@ public:
         info.allocationSize = size;
         info.memoryTypeIndex = mIndex;
         auto mem = new VulkanMemory(mDevice, info);
+        if (!mem->valid()) {
+            delete mem;
+            return MemChunk(nullptr, 0);
+        }
         return MemChunk(mem, 0);
     }
     virtual void onRelease(MemChunk ptr) override {

@@ -24,6 +24,11 @@ VulkanBuffer::VulkanBuffer(const VulkanMemoryPool& pool, bool separate, size_t s
     mMemory = const_cast<VulkanMemoryPool&>(mPool).allocMemory(memReq, requirements_mask, separate);
     //        FUNC_PRINT(mMemory->type());
     auto realMem = (VulkanMemory*)mMemory.first;
+    if (nullptr == realMem) {
+        MNN_ERROR("Vulkan: failed to allocate %zu bytes of device memory\n", size);
+        mReleased = true;  // nothing to return to the pool
+        return;
+    }
 
     if (nullptr != hostData) {
         void* data = nullptr;

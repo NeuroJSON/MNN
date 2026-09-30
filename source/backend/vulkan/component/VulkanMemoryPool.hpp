@@ -33,9 +33,12 @@ public:
     VkDeviceSize size() const {
         return mSize;
     }
+    bool valid() const {
+        return VK_NULL_HANDLE != mMemory;
+    }
 
 private:
-    VkDeviceMemory mMemory;
+    VkDeviceMemory mMemory = VK_NULL_HANDLE;
     const VulkanDevice& mDevice;
     uint32_t mTypeIndex;
     VkDeviceSize mSize;

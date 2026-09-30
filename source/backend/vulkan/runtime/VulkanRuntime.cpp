@@ -19,6 +19,10 @@ public:
     }
     virtual MemChunk onAlloc(size_t size, size_t align) override {
         VulkanBuffer* newBuffer = new VulkanBuffer(mPool, false, size, nullptr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0);
+        if (!newBuffer->valid()) {
+            delete newBuffer;
+            return MemChunk(nullptr, 0);
+        }
         return MemChunk(newBuffer, 0);
     }
     virtual void onRelease(MemChunk ptr) override {

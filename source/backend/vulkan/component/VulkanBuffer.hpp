@@ -31,6 +31,10 @@ public:
     void flush(bool write, int start, int size) const;
 
     void release();
+    // False when device memory could not be allocated (out of memory).
+    bool valid() const {
+        return nullptr != mMemory.first;
+    }
 
 private:
     const VulkanMemoryPool& mPool;
