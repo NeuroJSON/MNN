@@ -77,8 +77,24 @@ void VulkanMemoryPool::returnBuffer(VkBuffer buffer, size_t size, VkBufferUsageF
 MemChunk VulkanMemoryPool::allocMemory(const VkMemoryRequirements& requirements, VkFlags extraMask,
                                                   bool separate) {
     uint32_t index = 0;
+    // Without host-access requirements prefer a DEVICE_LOCAL type. Taking the
+    // first allowed type is not enough: e.g. NVIDIA's proprietary driver lists
+    // flag-less types backed by the system-RAM heap first, so every tensor
+    // would live across PCIe (~20-50x lower bandwidth on a discrete GPU).
+    bool found = false;
+    if (0 == (extraMask & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        const VkFlags wanted = extraMask | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        for (uint32_t i = 0; i < mDevice.memProty().memoryTypeCount; i++) {
+            if ((requirements.memoryTypeBits & (1u << i))
+                && (mDevice.memProty().memoryTypes[i].propertyFlags & wanted) == wanted) {
+                index = i;
+                found = true;
+                break;
+            }
+        }
+    }
     auto typeBits  = requirements.memoryTypeBits;
-    for (uint32_t i = 0; i < mDevice.memProty().memoryTypeCount; i++) {
+    for (uint32_t i = 0; !found && i < mDevice.memProty().memoryTypeCount; i++) {
         if ((typeBits & 1) == 1) {
             // Type is available, does it match user properties?
             if ((mDevice.memProty().memoryTypes[i].propertyFlags & extraMask) == extraMask) {
