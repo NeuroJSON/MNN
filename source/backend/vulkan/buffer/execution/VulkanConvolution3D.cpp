@@ -24,6 +24,7 @@
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,7 +38,7 @@ struct Conv3DParam {
     ivec4 inSize;   // W, H, D, C4
     ivec4 outSize;  // W, H, D, C4
     ivec4 chan;     // Cin, Cout, batch, OC tiles
-    ivec4 work;     // W tiles, total work-items, 0, 0
+    ivec4 work;     // W tiles, H tiles, 0, 0
 };
 
 int envInt(const char* name, int fallback) {
@@ -60,12 +61,6 @@ public:
             mPad[i]    = common->pads()->Get(i);
         }
         mActivation = common->relu6() ? 2 : (common->relu() ? 1 : 0);
-        mWTile  = envInt("MNN_VK_CONV3D_WTILE", 2);
-        mOCTile = envInt("MNN_VK_CONV3D_OCTILE", 4);
-        mLocal  = envInt("MNN_VK_CONV3D_LOCAL", 64);
-        if (mWTile < 1)  mWTile = 1;
-        if (mOCTile < 1) mOCTile = 1;
-        if (mLocal < 1)  mLocal = 64;
         mUniform = static_cast<VulkanBackend*>(bn)->allocUniform();
     }
 
@@ -127,18 +122,32 @@ public:
         param.outSize[1] = output->length(3);
         param.outSize[2] = output->length(2);
         param.outSize[3] = outC4;
-        const int wTiles  = UP_DIV(param.outSize[0], mWTile);
-        const int ocTiles = UP_DIV(outC4, mOCTile);
-        const size_t total = (size_t)batch * ocTiles * param.outSize[2] * param.outSize[1] * wTiles;
-        if (total > (size_t)0x7fffffff) {
-            return NOT_SUPPORT;
+        // Tile and work-group shape by output size; env vars override every
+        // field (for tuning). The work-group spans W tiles x rows x OC blocks.
+        Tiling tl = pickTiling((long)param.outSize[0] * param.outSize[1] * param.outSize[2]);
+        const auto& limits = vkBn->proty().limits;
+        int hTiles = UP_DIV(param.outSize[1], tl.th);
+        while (tl.th < param.outSize[1]
+               && (uint32_t)UP_DIV(param.outSize[2] * hTiles, tl.ly) > limits.maxComputeWorkGroupCount[1]) {
+            tl.th *= 2;  // fold more rows per invocation to stay within the Y group limit
+            hTiles = UP_DIV(param.outSize[1], tl.th);
+        }
+        const int wTiles  = UP_DIV(param.outSize[0], tl.tw);
+        const int ocTiles = UP_DIV(outC4, tl.toc);
+        const uint32_t groups[3] = {(uint32_t)UP_DIV(wTiles, tl.lx),
+                                    (uint32_t)UP_DIV(param.outSize[2] * hTiles, tl.ly),
+                                    (uint32_t)UP_DIV(batch * ocTiles, tl.lz)};
+        for (int i = 0; i < 3; ++i) {
+            if (groups[i] > limits.maxComputeWorkGroupCount[i]) {
+                return NOT_SUPPORT;
+            }
         }
         param.chan[0] = input->length(1);
         param.chan[1] = output->length(1);
         param.chan[2] = batch;
         param.chan[3] = ocTiles;
         param.work[0] = wTiles;
-        param.work[1] = (int)total;
+        param.work[1] = hTiles;
         {
             auto ptr = mUniform->map();
             ::memcpy(ptr, &param, sizeof(param));
@@ -157,9 +166,9 @@ public:
             (uint32_t)mStride[2], (uint32_t)mStride[1], (uint32_t)mStride[0],
             (uint32_t)mPad[2],    (uint32_t)mPad[1],    (uint32_t)mPad[0],
             inNC4 ? 1u : 0u, outNC4 ? 1u : 0u, mTransposed ? 1u : 0u,
-            (uint32_t)mWTile, (uint32_t)mOCTile, (uint32_t)mActivation
+            (uint32_t)tl.tw, (uint32_t)tl.toc, (uint32_t)mActivation, (uint32_t)tl.th
         };
-        auto pipeline = vkBn->getPipeline(key, types, {(uint32_t)mLocal, 1, 1}, spec);
+        auto pipeline = vkBn->getPipeline(key, types, {(uint32_t)tl.lx, (uint32_t)tl.ly, (uint32_t)tl.lz}, spec);
         if (nullptr == pipeline) {
             return NOT_SUPPORT;
         }
@@ -178,13 +187,7 @@ public:
         mDescriptorSet->writeBuffer(outBuf.first->buffer(), 6, outSize, outBuf.second);
         pipeline->bind(cmdBuffer->get(), mDescriptorSet->get());
 
-        // 1D dispatch, spilling into Y when the group count exceeds the
-        // device's X limit (65535 on some Intel / mobile drivers).
-        const uint32_t groups = (uint32_t)UP_DIV(total, (size_t)mLocal);
-        const uint32_t maxX   = vkBn->proty().limits.maxComputeWorkGroupCount[0];
-        const uint32_t gx     = groups < maxX ? groups : maxX;
-        const uint32_t gy     = UP_DIV(groups, gx);
-        vkCmdDispatch(cmdBuffer->get(), gx, gy, 1);
+        vkCmdDispatch(cmdBuffer->get(), groups[0], groups[1], groups[2]);
         return NO_ERROR;
     }
 
@@ -203,6 +206,27 @@ public:
 #endif
 
 private:
+    struct Tiling {
+        int tw, th, toc;     // voxels along W, rows along H, OC blocks per invocation
+        int lx, ly, lz;      // work-group shape
+    };
+    // Defaults from a sweep of every SIAM v0.3 layer shape on an RTX 5090
+    // (per-layer GPU time, 14 configurations): a work-group spanning 8 OC
+    // blocks (input voxels shared through L1) with small spatial tiles wins;
+    // unlike the OpenCL kernel, 4x2 tiles are slower here. Deep layers with
+    // few voxels need more, smaller invocations.
+    static Tiling pickTiling(long outVoxels) {
+        Tiling t = outVoxels >= 65536 ? Tiling{2, 1, 1, 16, 1, 8}
+                 : (outVoxels >= 8192 ? Tiling{2, 2, 1, 8, 2, 8} : Tiling{1, 1, 1, 8, 4, 4});
+        t.tw  = std::max(1, envInt("MNN_VK_CONV3D_WTILE", t.tw));
+        t.th  = std::max(1, envInt("MNN_VK_CONV3D_HTILE", t.th));
+        t.toc = std::max(1, envInt("MNN_VK_CONV3D_OCTILE", t.toc));
+        t.lx  = std::max(1, envInt("MNN_VK_CONV3D_LX", envInt("MNN_VK_CONV3D_LOCAL", t.lx)));
+        t.ly  = std::max(1, envInt("MNN_VK_CONV3D_LY", t.ly));
+        t.lz  = std::max(1, envInt("MNN_VK_CONV3D_LZ", t.lz));
+        return t;
+    }
+
     std::shared_ptr<VulkanBuffer> upload(const std::vector<float>& host, bool fp16) {
         auto vkBn = static_cast<VulkanBackend*>(backend());
         const size_t bytes = host.size() * (fp16 ? sizeof(int16_t) : sizeof(float));
@@ -232,9 +256,6 @@ private:
     int mStride[3];
     int mPad[3];
     int mActivation;
-    int mWTile;
-    int mOCTile;
-    int mLocal;
     std::shared_ptr<VulkanBuffer> mWeightBuffer;
     std::shared_ptr<VulkanBuffer> mBiasBuffer;
     std::shared_ptr<VulkanBuffer> mUniform;

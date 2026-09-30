@@ -2,12 +2,13 @@
 // backend. Vulkan counterpart of the OpenCL conv_3d_buf.cl / deconv_3d_buf.cl
 // kernels; the host side is VulkanConvolution3D.cpp.
 //
-// One work-item computes OC_TILE output-channel blocks (4 channels each) x
-// W_TILE output voxels of one W row, so every weight vec4 it loads is reused
-// W_TILE times and every input vec4 OC_TILE times. The W_TILE voxels are
-// interleaved (ow = wt + j * wTiles) rather than adjacent, so for each j the
-// lanes of a warp touch consecutive voxels and loads/stores stay coalesced;
-// all lanes of a work-group read the same weights (hardware broadcast).
+// One invocation computes OC_TILE output-channel blocks (4 channels each) x
+// H_TILE rows x W_TILE voxels. The W_TILE voxels are interleaved
+// (ow = wt + j * wTiles), so for each j the lanes of a subgroup touch
+// consecutive voxels and loads / stores stay coalesced. The launch is 3D
+// (x: W tiles, y: D x H tiles, z: batch x OC tiles) with a work-group shape
+// chosen by the host: a group spanning several OC blocks shares its input
+// voxels through L1, which on NVIDIA beats register-tiling the channels.
 //
 // Everything that is fixed per layer -- kernel, stride, pad, tensor layouts,
 // conv vs. transposed -- is a specialization constant, so the driver compiles
@@ -19,7 +20,7 @@
 // Weights: FLOAT4 index ((ocb * KVOL + kpos) * CIN4 + icb) * 4 + ci,
 //   each vec4 holding 4 output channels for input lane ci; tails zero-padded.
 
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 layout(constant_id = 3)  const int KW = 3;
 layout(constant_id = 4)  const int KH = 3;
@@ -36,6 +37,7 @@ layout(constant_id = 14) const int TRANSPOSED = 0;  // 1: ConvTranspose3D (gathe
 layout(constant_id = 15) const int W_TILE = 4;      // outputs per work-item along W
 layout(constant_id = 16) const int OC_TILE = 2;     // output-channel blocks per work-item
 layout(constant_id = 17) const int ACTIVATION = 0;  // 0: none, 1: relu, 2: relu6
+layout(constant_id = 18) const int H_TILE = 1;      // output rows per work-item
 
 const int KVOL = KD * KH * KW;
 
@@ -50,7 +52,7 @@ layout(set = 0, binding = 4) uniform ConstBuffer {
     ivec4 inSize;   // W, H, D, C4
     ivec4 outSize;  // W, H, D, C4
     ivec4 chan;     // Cin, Cout, batch, OC tiles (= ceil(outC4 / OC_TILE))
-    ivec4 work;     // W tiles, total work-items, 0, 0
+    ivec4 work;     // W tiles, H tiles, 0, 0
 } uConst;
 layout(set = 0, binding = 5) readonly  buffer Input1  { FLOAT data[]; } uInput1;
 layout(set = 0, binding = 6) writeonly buffer Output1 { FLOAT data[]; } uOutput1;
@@ -92,11 +94,6 @@ int srcCoord(int o, int k, int stride, int pad, int inLen) {
 }
 
 void main() {
-    const int index = int(gl_GlobalInvocationID.x)
-                    + int(gl_GlobalInvocationID.y) * int(gl_NumWorkGroups.x * gl_WorkGroupSize.x);
-    if (index >= uConst.work.y) {
-        return;
-    }
     const int inW = uConst.inSize.x;
     const int inH = uConst.inSize.y;
     const int inD = uConst.inSize.z;
@@ -106,20 +103,27 @@ void main() {
     const int outD = uConst.outSize.z;
     const int outC4 = uConst.outSize.w;
     const int wTiles = uConst.work.x;
+    const int hTiles = uConst.work.y;
+    const int ocTiles = uConst.chan.w;
 
-    int t = index;
-    const int wt = t % wTiles;  t /= wTiles;
-    const int oh = t % outH;    t /= outH;
-    const int od = t % outD;    t /= outD;
-    const int oct = t % uConst.chan.w;
-    const int n = t / uConst.chan.w;
-    const int ocb0 = oct * OC_TILE;
+    const int wt = int(gl_GlobalInvocationID.x);
+    const int dh = int(gl_GlobalInvocationID.y);
+    const int zc = int(gl_GlobalInvocationID.z);
+    if (wt >= wTiles || dh >= outD * hTiles || zc >= uConst.chan.z * ocTiles) {
+        return;
+    }
+    const int od = dh / hTiles;
+    const int oh0 = (dh % hTiles) * H_TILE;
+    const int n = zc / ocTiles;
+    const int ocb0 = (zc % ocTiles) * OC_TILE;
 
-    vec4 acc[OC_TILE][W_TILE];
+    vec4 acc[OC_TILE][H_TILE][W_TILE];
     for (int o = 0; o < OC_TILE; ++o) {
         const vec4 b = (ocb0 + o < outC4) ? vec4(uBias.data[ocb0 + o]) : vec4(0.0);
-        for (int j = 0; j < W_TILE; ++j) {
-            acc[o][j] = b;
+        for (int i = 0; i < H_TILE; ++i) {
+            for (int j = 0; j < W_TILE; ++j) {
+                acc[o][i][j] = b;
+            }
         }
     }
 
@@ -127,63 +131,90 @@ void main() {
         const int iz = srcCoord(od, kd, SD, PD, inD);
         if (iz < 0) continue;
         for (int kh = 0; kh < KH; ++kh) {
-            const int iy = srcCoord(oh, kh, SH, PH, inH);
-            if (iy < 0) continue;
+            int iy[H_TILE];
+            bool anyY = false;
+            for (int i = 0; i < H_TILE; ++i) {
+                iy[i] = (oh0 + i < outH) ? srcCoord(oh0 + i, kh, SH, PH, inH) : -1;
+                anyY = anyY || (iy[i] >= 0);
+            }
+            if (!anyY) continue;
             for (int kw = 0; kw < KW; ++kw) {
                 int ix[W_TILE];
-                bool any = false;
+                bool anyX = false;
                 for (int j = 0; j < W_TILE; ++j) {
                     const int ow = wt + j * wTiles;
                     ix[j] = (ow < outW) ? srcCoord(ow, kw, SW, PW, inW) : -1;
-                    any = any || (ix[j] >= 0);
+                    anyX = anyX || (ix[j] >= 0);
                 }
-                if (!any) continue;
+                if (!anyX) continue;
                 const int kpos = (kd * KH + kh) * KW + kw;
+                // Index math hoisted out of the channel loop: per input-channel
+                // block only constant strides are added (the loop is
+                // issue-bound, so per-load index multiplies cost real time).
+                int wBase[OC_TILE];
+                for (int o = 0; o < OC_TILE; ++o) {
+                    // Clamp the block index for the ragged last tile: its
+                    // results are discarded, the load just has to be valid.
+                    wBase[o] = ((min(ocb0 + o, outC4 - 1) * KVOL + kpos) * inC4) * 4;
+                }
+                int sIdx[H_TILE][W_TILE];
+                for (int i = 0; i < H_TILE; ++i) {
+                    for (int j = 0; j < W_TILE; ++j) {
+                        sIdx[i][j] = (iy[i] < 0 || ix[j] < 0) ? -1 : (iz * inH + iy[i]) * inW + ix[j];
+                    }
+                }
+                const int icbStride = uConst.chan.z * inD * inH * inW;   // one C4 block, NC4HW4
+                int icbBase = n * inD * inH * inW;
                 for (int icb = 0; icb < inC4; ++icb) {
                     vec4 w[OC_TILE][4];
                     for (int o = 0; o < OC_TILE; ++o) {
-                        // Clamp the block index for the ragged last tile: its
-                        // results are discarded, the load just has to be valid.
-                        const int ocb = min(ocb0 + o, outC4 - 1);
-                        const int wb = ((ocb * KVOL + kpos) * inC4 + icb) * 4;
+                        const int wb = wBase[o] + icb * 4;
                         w[o][0] = vec4(uKernel.data[wb]);
                         w[o][1] = vec4(uKernel.data[wb + 1]);
                         w[o][2] = vec4(uKernel.data[wb + 2]);
                         w[o][3] = vec4(uKernel.data[wb + 3]);
                     }
-                    for (int j = 0; j < W_TILE; ++j) {
-                        if (ix[j] < 0) continue;
-                        const vec4 v = loadInput(icb, n, iz, iy, ix[j]);
-                        for (int o = 0; o < OC_TILE; ++o) {
-                            acc[o][j] += v.x * w[o][0] + v.y * w[o][1] + v.z * w[o][2] + v.w * w[o][3];
+                    for (int i = 0; i < H_TILE; ++i) {
+                        for (int j = 0; j < W_TILE; ++j) {
+                            if (sIdx[i][j] < 0) continue;
+                            const vec4 v = (IN_NC4 == 1) ? vec4(uInput4.data[icbBase + sIdx[i][j]])
+                                                         : loadInput(icb, n, iz, iy[i], ix[j]);
+                            for (int o = 0; o < OC_TILE; ++o) {
+                                acc[o][i][j] += v.x * w[o][0] + v.y * w[o][1] + v.z * w[o][2] + v.w * w[o][3];
+                            }
                         }
                     }
+                    icbBase += icbStride;
                 }
             }
         }
     }
 
     const int S = outD * outH * outW;
-    const int rowBase = (od * outH + oh) * outW;
     const int cout = uConst.chan.y;
     for (int o = 0; o < OC_TILE; ++o) {
         const int ocb = ocb0 + o;
         if (ocb >= outC4) break;
-        for (int j = 0; j < W_TILE; ++j) {
-            const int ow = wt + j * wTiles;
-            if (ow >= outW) break;
-            const int s = rowBase + ow;
-            if (ACTIVATION == 1) acc[o][j] = max(acc[o][j], vec4(0.0));
-            if (ACTIVATION == 2) acc[o][j] = clamp(acc[o][j], vec4(0.0), vec4(6.0));
-            if (OUT_NC4 == 1) {
-                uOutput4.data[(ocb * uConst.chan.z + n) * S + s] = FLOAT4(acc[o][j]);
-            } else {
-                const int c = ocb * 4;
-                const int base = (n * cout + c) * S + s;
-                uOutput1.data[base] = FLOAT(acc[o][j].x);
-                if (c + 1 < cout) uOutput1.data[base + S] = FLOAT(acc[o][j].y);
-                if (c + 2 < cout) uOutput1.data[base + 2 * S] = FLOAT(acc[o][j].z);
-                if (c + 3 < cout) uOutput1.data[base + 3 * S] = FLOAT(acc[o][j].w);
+        for (int i = 0; i < H_TILE; ++i) {
+            const int oh = oh0 + i;
+            if (oh >= outH) break;
+            for (int j = 0; j < W_TILE; ++j) {
+                const int ow = wt + j * wTiles;
+                if (ow >= outW) break;
+                const int s = (od * outH + oh) * outW + ow;
+                vec4 r = acc[o][i][j];
+                if (ACTIVATION == 1) r = max(r, vec4(0.0));
+                if (ACTIVATION == 2) r = clamp(r, vec4(0.0), vec4(6.0));
+                if (OUT_NC4 == 1) {
+                    uOutput4.data[(ocb * uConst.chan.z + n) * S + s] = FLOAT4(r);
+                } else {
+                    const int c = ocb * 4;
+                    const int base = (n * cout + c) * S + s;
+                    uOutput1.data[base] = FLOAT(r.x);
+                    if (c + 1 < cout) uOutput1.data[base + S] = FLOAT(r.y);
+                    if (c + 2 < cout) uOutput1.data[base + 2 * S] = FLOAT(r.z);
+                    if (c + 3 < cout) uOutput1.data[base + 3 * S] = FLOAT(r.w);
+                }
             }
         }
     }
