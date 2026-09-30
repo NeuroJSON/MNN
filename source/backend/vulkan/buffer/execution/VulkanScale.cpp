@@ -85,7 +85,12 @@ ErrorCode VulkanScale::onEncode(const std::vector<Tensor*>& inputs, const std::v
     ::memset(scaleP, 0, sizeof(gpuScaleParam));
 
     const int channelDiv4 = UP_DIV(input->channel(), 4);
-    auto planeSize = input->width() * input->height() * input->batch();
+    // batch * all spatial dims: width()/height() only cover dims 2-3, which
+    // drops the trailing axes of 5D (N, C, D, H, W) tensors.
+    int planeSize = input->batch();
+    for (int i = 2; i < input->dimensions(); ++i) {
+        planeSize *= input->length(i);
+    }
     auto totalSize = planeSize * channelDiv4;
 
     scaleP->imgSize[0] = planeSize;
