@@ -478,5 +478,8 @@
     },
     "dynamic_w8a8_dequant_correction.comp": {
         "useFP16": true
+    },
+    "conv3d.comp": {
+        "useFP16": true
     }
 }

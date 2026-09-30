@@ -762,4 +762,8 @@ extern const unsigned char glsl_dynamic_quant_reduce_minmax_comp[];
 extern unsigned int glsl_dynamic_quant_reduce_minmax_comp_len;
 extern const unsigned char glsl_dynamic_quant_reduce_minmax_FP16_comp[];
 extern unsigned int glsl_dynamic_quant_reduce_minmax_FP16_comp_len;
+extern const unsigned char glsl_conv3d_comp[];
+extern unsigned int glsl_conv3d_comp_len;
+extern const unsigned char glsl_conv3d_FP16_comp[];
+extern unsigned int glsl_conv3d_FP16_comp_len;
 #endif

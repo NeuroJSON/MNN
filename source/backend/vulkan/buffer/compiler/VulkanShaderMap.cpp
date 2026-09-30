@@ -384,5 +384,7 @@ mMaps.insert(std::make_pair("glsl_binary_blit_int_NOTEQUAL_comp", std::make_pair
 mMaps.insert(std::make_pair("glsl_binary_blit_int_VMOD_comp", std::make_pair(glsl_binary_blit_int_VMOD_comp,glsl_binary_blit_int_VMOD_comp_len)));
 mMaps.insert(std::make_pair("glsl_dynamic_quant_reduce_minmax_comp", std::make_pair(glsl_dynamic_quant_reduce_minmax_comp,glsl_dynamic_quant_reduce_minmax_comp_len)));
 mMaps.insert(std::make_pair("glsl_dynamic_quant_reduce_minmax_FP16_comp", std::make_pair(glsl_dynamic_quant_reduce_minmax_FP16_comp,glsl_dynamic_quant_reduce_minmax_FP16_comp_len)));
+mMaps.insert(std::make_pair("glsl_conv3d_comp", std::make_pair(glsl_conv3d_comp,glsl_conv3d_comp_len)));
+mMaps.insert(std::make_pair("glsl_conv3d_FP16_comp", std::make_pair(glsl_conv3d_FP16_comp,glsl_conv3d_FP16_comp_len)));
 }
 }

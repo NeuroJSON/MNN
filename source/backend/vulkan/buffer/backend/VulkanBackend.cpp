@@ -285,7 +285,9 @@ Execution* VulkanBackend::onCreate(const std::vector<Tensor*>& inputs, const std
     }
 
 #ifdef ENABLE_VULKAN_TIME_PROFILE
-    originExecution->setName(EnumNameOpType(op->type()));
+    if (originExecution->getName() == kVulkanTimeProfileDefaultExecutionName) {
+        originExecution->setName(EnumNameOpType(op->type()));
+    }
 #endif
 
     if (mDirect) {
