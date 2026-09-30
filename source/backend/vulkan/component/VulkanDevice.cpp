@@ -208,13 +208,50 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance)
 
     deviceFeatures2.pNext = pNextChain;
 
+    // VK_EXT_external_memory_host (needs Vulkan 1.1 for VK_KHR_external_memory):
+    // lets large copies DMA straight to / from the caller's host tensor. Opt-in
+    // (MNN_VULKAN_HOST_IMPORT=1): pinning the pages on every copy costs more
+    // than the staging memcpy it saves (RTX 5090, 340 MB: import 52 ms +
+    // release 22 ms vs memcpy 11 ms; the DMA speed is the same).
+    bool hostImport = false;
+    {
+        VkPhysicalDeviceProperties prop;
+        vkGetPhysicalDeviceProperties(mPhysicalDevice, &prop);
+        const char* useImport = ::getenv("MNN_VULKAN_HOST_IMPORT");
+        hostImport = prop.apiVersion >= VK_API_VERSION_1_1 && nullptr != vkGetPhysicalDeviceProperties2
+                     && _hasExtension(availableDeviceExtensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)
+                     && nullptr != useImport && useImport[0] == '1';
+        if (hostImport) {
+            deviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        }
+    }
+
+    // Dedicated transfer family for host<->device copies (see hasTransferQueue).
+    // MNN_VULKAN_NO_TRANSFER_QUEUE=1 keeps all copies on the compute queue.
+    std::vector<VkDeviceQueueCreateInfo> queueCreateInfos{queueCreateInfo};
+    {
+        const char* noTransfer = ::getenv("MNN_VULKAN_NO_TRANSFER_QUEUE");
+        const VkQueueFlags engineBits = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+        for (uint32_t i = 0; i < queueFamilyCount && !(nullptr != noTransfer && noTransfer[0] == '1'); ++i) {
+            const auto& family = queueFamilyProperties[i];
+            if (i != mQueueFamilyIndex && family.queueCount > 0 && (family.queueFlags & VK_QUEUE_TRANSFER_BIT)
+                && 0 == (family.queueFlags & engineBits)) {
+                mTransferFamily = i;
+                VkDeviceQueueCreateInfo transferInfo = queueCreateInfo;
+                transferInfo.queueFamilyIndex = i;
+                queueCreateInfos.push_back(transferInfo);
+                break;
+            }
+        }
+    }
+
     // Create Device. Get Queue.
     VkDeviceCreateInfo deviceCreateInfo{
         /* .sType                   = */ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         /* .pNext                   = */ nullptr,
         /* .flags                   = */ 0,
-        /* .queueCreateInfoCount    = */ 1,
-        /* .pQueueCreateInfos       = */ &queueCreateInfo,
+        /* .queueCreateInfoCount    = */ static_cast<uint32_t>(queueCreateInfos.size()),
+        /* .pQueueCreateInfos       = */ queueCreateInfos.data(),
         /* .enabledLayerCount       = */ 0,
         /* .ppEnabledLayerNames     = */ nullptr,
         /* .enabledExtensionCount   = */ static_cast<uint32_t>(deviceExtensions.size()),
@@ -229,6 +266,22 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance)
         return;
     }
     getDeviceQueue(mQueueFamilyIndex, 0, mQueue);
+    createTransferQueue();
+
+    if (hostImport) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 prop2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        prop2.pNext = &hostProps;
+        vkGetPhysicalDeviceProperties2(mPhysicalDevice, &prop2);
+        auto fn = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            vkGetDeviceProcAddr(mDevice, "vkGetMemoryHostPointerPropertiesEXT"));
+        const VkDeviceSize align = hostProps.minImportedHostPointerAlignment;
+        if (nullptr != fn && align > 0 && (align & (align - 1)) == 0) {
+            mGetMemoryHostPointerProperties = fn;
+            mHostImportAlignment = align;
+        }
+    }
 
     // Query device properties.
     vkGetPhysicalDeviceProperties(mPhysicalDevice, &mDeviceProty);
@@ -275,6 +328,12 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, VkPhysicalD
 }
 
 VulkanDevice::~VulkanDevice() {
+    if (VK_NULL_HANDLE != mTransferFence) {
+        vkDestroyFence(mDevice, mTransferFence, nullptr);
+    }
+    if (VK_NULL_HANDLE != mTransferPool) {
+        vkDestroyCommandPool(mDevice, mTransferPool, nullptr);
+    }
     if (mOwner && (VK_NULL_HANDLE != mDevice)) {
         vkDestroyDevice(mDevice, nullptr);
         mDevice = VK_NULL_HANDLE;
@@ -300,7 +359,75 @@ const VkResult VulkanDevice::createBuffer(VkBuffer& buffer, const size_t size, c
     info.sharingMode           = shared;
     info.pQueueFamilyIndices   = &mQueueFamilyIndex;
     info.queueFamilyIndexCount = 1;
+    const uint32_t families[2] = {mQueueFamilyIndex, mTransferFamily};
+    if (VK_SHARING_MODE_CONCURRENT == shared) {
+        // CONCURRENT needs >= 2 distinct families; without a transfer queue
+        // the buffer is only ever used by the compute family.
+        if (hasTransferQueue()) {
+            info.pQueueFamilyIndices   = families;
+            info.queueFamilyIndexCount = 2;
+        } else {
+            info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        }
+    }
     return vkCreateBuffer(mDevice, &info, allocator, &buffer);
+}
+
+void VulkanDevice::createTransferQueue() {
+    if (UINT32_MAX == mTransferFamily) {
+        return;
+    }
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(mDevice, mTransferFamily, 0, &queue);
+    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = mTransferFamily;
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (VK_NULL_HANDLE == queue || VK_SUCCESS != vkCreateCommandPool(mDevice, &poolInfo, nullptr, &mTransferPool)
+        || VK_SUCCESS != vkCreateFence(mDevice, &fenceInfo, nullptr, &mTransferFence)) {
+        mTransferFamily = UINT32_MAX;
+        return;
+    }
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool        = mTransferPool;
+    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    if (VK_SUCCESS != vkAllocateCommandBuffers(mDevice, &allocInfo, &mTransferCmd)) {
+        mTransferFamily = UINT32_MAX;
+        return;
+    }
+    mTransferQueue = queue;
+}
+
+bool VulkanDevice::transferCopy(VkBuffer src, VkBuffer dst, const VkBufferCopy& region, bool dstIsHost) const {
+    if (!hasTransferQueue()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mTransferMutex);
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (VK_SUCCESS != vkResetCommandBuffer(mTransferCmd, 0) || VK_SUCCESS != vkBeginCommandBuffer(mTransferCmd, &beginInfo)) {
+        return false;
+    }
+    vkCmdCopyBuffer(mTransferCmd, src, dst, 1, &region);
+    if (dstIsHost) {
+        // Make the transfer writes available to host reads after the fence.
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(mTransferCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
+                             nullptr, 0, nullptr);
+    }
+    if (VK_SUCCESS != vkEndCommandBuffer(mTransferCmd)) {
+        return false;
+    }
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers    = &mTransferCmd;
+    bool ok = VK_SUCCESS == vkQueueSubmit(mTransferQueue, 1, &submit, mTransferFence)
+              && VK_SUCCESS == vkWaitForFences(mDevice, 1, &mTransferFence, VK_TRUE, UINT64_MAX);
+    vkResetFences(mDevice, 1, &mTransferFence);
+    return ok;
 }
 
 const void VulkanDevice::getBufferMemoryRequirements(VkBuffer buffer, VkMemoryRequirements& memoryRequirements) const {

@@ -8,6 +8,9 @@
 
 #include "VulkanBackend.hpp"
 #include <algorithm>
+#include <cstring>
+#include <thread>
+#include <vector>
 #include "core/Execution.hpp"
 #include "core/Macro.h"
 #include <MNN/Tensor.hpp>
@@ -72,14 +75,50 @@ void _VKHalfToFloat(const int16_t* src, float* dst, size_t size) {
 
 #endif
 
+// Host <-> staging-buffer copies of large tensors (e.g. 3D segmentation
+// logits, hundreds of MB per inference) are bound by a single core's memcpy /
+// fp16<->fp32 conversion throughput, several times below what the memory
+// system sustains. Split them across a few threads; small copies stay serial.
+// fn(start, count) processes elements [start, start + count).
+template <typename Fn>
+static void _parallelChunks(size_t count, size_t elemBytes, Fn fn) {
+    const size_t kMinParallelBytes = 16 * 1024 * 1024;
+    unsigned int n = std::thread::hardware_concurrency();
+    n = std::min(n == 0 ? 1u : n, 8u);
+    if (count * elemBytes < kMinParallelBytes || n < 2) {
+        fn((size_t)0, count);
+        return;
+    }
+    const size_t chunk = UP_DIV(count, (size_t)n * 16) * 16;
+    std::vector<std::thread> workers;
+    for (unsigned int i = 1; i < n && i * chunk < count; ++i) {
+        const size_t start = i * chunk;
+        const size_t len = std::min(chunk, count - start);
+        workers.emplace_back([=]() { fn(start, len); });
+    }
+    fn((size_t)0, std::min(chunk, count));
+    for (auto& w : workers) {
+        w.join();
+    }
+}
+
+static void _parallelMemcpy(void* dst, const void* src, size_t bytes) {
+    _parallelChunks(bytes, 1, [=](size_t start, size_t len) {
+        ::memcpy((uint8_t*)dst + start, (const uint8_t*)src + start, len);
+    });
+}
+
 static void _copyBufferToTensor(const Tensor* dest, const VulkanBuffer* source, size_t offset, bool half2float = false) {
     auto sourcePtr   = (const float*)source->map(offset);
     if (half2float) {
         auto dstPtr = dest->host<float>();
         auto elementCount = static_cast<size_t>(dest->elementSize());
-        HALF_TO_FLOAT(reinterpret_cast<const int16_t*>(sourcePtr), dstPtr, elementCount);
+        auto halfPtr = reinterpret_cast<const int16_t*>(sourcePtr);
+        _parallelChunks(elementCount, sizeof(float), [=](size_t start, size_t len) {
+            HALF_TO_FLOAT(halfPtr + start, dstPtr + start, len);
+        });
     } else {
-        ::memcpy(dest->host<float>(), sourcePtr, dest->usize());
+        _parallelMemcpy(dest->host<float>(), sourcePtr, dest->usize());
     }
     source->unmap();
 }
@@ -89,9 +128,12 @@ static void _copyTensorToBuffer(const Tensor* source, const VulkanBuffer* dest, 
     if (float2half) {
         auto srcPtr = source->host<float>();
         auto elementCount = static_cast<size_t>(source->elementSize());
-        FLOAT_TO_HALF(srcPtr, reinterpret_cast<int16_t*>(destPtr), elementCount);
+        auto halfPtr = reinterpret_cast<int16_t*>(destPtr);
+        _parallelChunks(elementCount, sizeof(float), [=](size_t start, size_t len) {
+            FLOAT_TO_HALF(srcPtr + start, halfPtr + start, len);
+        });
     } else {
-        ::memcpy(destPtr, source->host<float>(), source->usize());
+        _parallelMemcpy(destPtr, source->host<float>(), source->usize());
     }
     dest->unmap();
 }
@@ -389,8 +431,22 @@ static Tensor::DimensionType _convert(MNN_DATA_FORMAT format) {
     return Tensor::CAFFE;
 }
 std::shared_ptr<VulkanBuffer> VulkanBackend::createHostBuffer(size_t size) const {
+    // Staging buffers are read back by the CPU (output copies), so prefer
+    // HOST_CACHED memory: plain HOST_VISIBLE is write-combined on discrete GPUs
+    // and CPU reads from it run at well under 1 GB/s. HOST_COHERENT is required
+    // too, because callers map/unmap without explicit invalidate/flush.
+    const VkFlags cached = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                           | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    VkFlags mask = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const auto& memProty = mRuntime->mDevice->memProty();
+    for (uint32_t i = 0; i < memProty.memoryTypeCount; ++i) {
+        if ((memProty.memoryTypes[i].propertyFlags & cached) == cached) {
+            mask = cached;
+            break;
+        }
+    }
     std::shared_ptr<VulkanBuffer> res;
-    res.reset(new VulkanBuffer(*mRuntime->mMemoryPool, false, size, nullptr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
+    res.reset(new VulkanBuffer(*mRuntime->mMemoryPool, false, size, nullptr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_CONCURRENT, mask));
     return res;
 }
 
@@ -427,6 +483,104 @@ void VulkanBackend::copyToGPUBuffer(const void* src, VkBuffer buffer, VkDeviceSi
     mHostBuffer->unmap();
     copyGPUToGPUBuffer(mHostBuffer->buffer(), buffer, size, 0, offset);
 }
+bool VulkanBackend::_copyWithHostImport(VkBuffer deviceBuffer, VkDeviceSize deviceOffset, void* host, size_t size,
+                                        bool deviceToHost) const {
+    // Below a few MB the staging memcpy is cheaper than pinning the pages.
+    const size_t kMinImportBytes = 4 * 1024 * 1024;
+    const auto& dev = *mRuntime->mDevice;
+    if (!dev.supportHostImport() || size < kMinImportBytes || nullptr == host) {
+        return false;
+    }
+    // Import whole pages around [host, host + size): the pointer and the size
+    // must be multiples of minImportedHostPointerAlignment. Only the requested
+    // range is ever written; the rest of the first / last page is untouched.
+    const VkDeviceSize align = dev.hostImportAlignment();
+    const uintptr_t start = reinterpret_cast<uintptr_t>(host);
+    const uintptr_t base = start & ~static_cast<uintptr_t>(align - 1);
+    const VkDeviceSize inner = start - base;
+    const VkDeviceSize importSize = UP_DIV(inner + size, align) * align;
+    void* basePtr = reinterpret_cast<void*>(base);
+
+    VkMemoryHostPointerPropertiesEXT hostProps{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (VK_SUCCESS != dev.getMemoryHostPointerProperties(basePtr, &hostProps) || 0 == hostProps.memoryTypeBits) {
+        return false;
+    }
+    VkExternalMemoryBufferCreateInfo externalInfo{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.pNext       = &externalInfo;
+    bufferInfo.size        = importSize;
+    bufferInfo.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer hostBuffer = VK_NULL_HANDLE;
+    if (VK_SUCCESS != vkCreateBuffer(dev.get(), &bufferInfo, nullptr, &hostBuffer)) {
+        return false;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev.get(), hostBuffer, &req);
+    // The CPU reads / writes the memory through its own pointer without any
+    // map / invalidate, so only HOST_COHERENT types are acceptable.
+    const uint32_t typeBits = req.memoryTypeBits & hostProps.memoryTypeBits;
+    uint32_t typeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < dev.memProty().memoryTypeCount; ++i) {
+        if ((typeBits & (1u << i))
+            && (dev.memProty().memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            typeIndex = i;
+            break;
+        }
+    }
+    VkDeviceMemory hostMemory = VK_NULL_HANDLE;
+    if (UINT32_MAX != typeIndex) {
+        VkImportMemoryHostPointerInfoEXT importInfo{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        importInfo.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        importInfo.pHostPointer = basePtr;
+        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocInfo.pNext           = &importInfo;
+        allocInfo.allocationSize  = importSize;
+        allocInfo.memoryTypeIndex = typeIndex;
+        if (VK_SUCCESS != vkAllocateMemory(dev.get(), &allocInfo, nullptr, &hostMemory)) {
+            hostMemory = VK_NULL_HANDLE;
+        }
+    }
+    if (VK_NULL_HANDLE == hostMemory || VK_SUCCESS != vkBindBufferMemory(dev.get(), hostBuffer, hostMemory, 0)) {
+        if (VK_NULL_HANDLE != hostMemory) {
+            vkFreeMemory(dev.get(), hostMemory, nullptr);
+        }
+        vkDestroyBuffer(dev.get(), hostBuffer, nullptr);
+        return false;
+    }
+
+    VkBufferCopy region;
+    region.size      = size;
+    region.srcOffset = deviceToHost ? deviceOffset : inner;
+    region.dstOffset = deviceToHost ? inner : deviceOffset;
+    if (dev.transferCopy(deviceToHost ? deviceBuffer : hostBuffer, deviceToHost ? hostBuffer : deviceBuffer, region,
+                         deviceToHost)) {
+        vkDestroyBuffer(dev.get(), hostBuffer, nullptr);
+        vkFreeMemory(dev.get(), hostMemory, nullptr);
+        return true;
+    }
+    auto cmdbuffer = mCmdBufferForCopy;
+    cmdbuffer->begin(0);
+    if (deviceToHost) {
+        vkCmdCopyBuffer(cmdbuffer->get(), deviceBuffer, hostBuffer, 1, &region);
+        // Make the transfer writes available to host reads after the fence.
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmdbuffer->get(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                             &barrier, 0, nullptr, 0, nullptr);
+    } else {
+        vkCmdCopyBuffer(cmdbuffer->get(), hostBuffer, deviceBuffer, 1, &region);
+    }
+    cmdbuffer->end();
+    pushCommand(cmdbuffer->get());
+    _finish();
+    vkDestroyBuffer(dev.get(), hostBuffer, nullptr);
+    vkFreeMemory(dev.get(), hostMemory, nullptr);
+    return true;
+}
+
 void VulkanBackend::_requireHostBuffer(size_t size) const {
     _finish();
     if (nullptr == mHostBuffer || mHostBuffer->size() < size) {
@@ -469,19 +623,25 @@ void VulkanBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTenso
             srcTensor = tempTensor.get();
         }
         size_t cpSize = calculateCpSize(srcTensor);
+        const bool float2half = srcTensor->getType().code == halide_type_float && mUseFP16;
+        if (!float2half && _copyWithHostImport(buffer->buffer(), offset, srcTensor->host<void>(), cpSize, false)) {
+            return;
+        }
         _requireHostBuffer(cpSize);
-        _copyTensorToBuffer(srcTensor, mHostBuffer.get(), 0, srcTensor->getType().code == halide_type_float && mUseFP16);
-        auto cmdbuffer = mCmdBufferForCopy;
-        cmdbuffer->begin(0);
+        _copyTensorToBuffer(srcTensor, mHostBuffer.get(), 0, float2half);
         VkBufferCopy bufferCopy;
         bufferCopy.size = cpSize;
         bufferCopy.dstOffset = offset;
         bufferCopy.srcOffset = 0;
-        vkCmdCopyBuffer(cmdbuffer->get(), mHostBuffer->buffer(), buffer->buffer(),
-                        1, &bufferCopy);
-        cmdbuffer->end();
-        pushCommand(cmdbuffer->get());
-        _finish();
+        if (!mRuntime->mDevice->transferCopy(mHostBuffer->buffer(), buffer->buffer(), bufferCopy, false)) {
+            auto cmdbuffer = mCmdBufferForCopy;
+            cmdbuffer->begin(0);
+            vkCmdCopyBuffer(cmdbuffer->get(), mHostBuffer->buffer(), buffer->buffer(),
+                            1, &bufferCopy);
+            cmdbuffer->end();
+            pushCommand(cmdbuffer->get());
+            _finish();
+        }
     } else if (dstTensor->host<float>() != nullptr) {
         // gpu->host
         _finish();
@@ -495,20 +655,26 @@ void VulkanBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTenso
             dstTensor = tempTensor.get();
         }
         size_t cpSize = calculateCpSize(dstTensor);
-        _requireHostBuffer(cpSize);
         auto buffer = reinterpret_cast<VulkanBuffer*>(srcTensor->deviceId());
         auto offset = TensorUtils::getDescribeOrigin(srcTensor)->offset;
-        auto cmdbuffer = mCmdBufferForCopy;
-        cmdbuffer->begin(0);
+        const bool half2float = dstTensor->getType().code == halide_type_float && mUseFP16;
+        if (!half2float && _copyWithHostImport(buffer->buffer(), offset, dstTensor->host<void>(), cpSize, true)) {
+            return;  // tempTensor (if any) converts into the caller's tensor on release
+        }
+        _requireHostBuffer(cpSize);
         VkBufferCopy bufferCopy;
         bufferCopy.size = cpSize;
         bufferCopy.dstOffset = 0;
         bufferCopy.srcOffset = offset;
-        vkCmdCopyBuffer(cmdbuffer->get(), buffer->buffer(), mHostBuffer->buffer(),
-                        1, &bufferCopy);
-        cmdbuffer->end();
-        pushCommand(cmdbuffer->get());
-        _finish();
+        if (!mRuntime->mDevice->transferCopy(buffer->buffer(), mHostBuffer->buffer(), bufferCopy, true)) {
+            auto cmdbuffer = mCmdBufferForCopy;
+            cmdbuffer->begin(0);
+            vkCmdCopyBuffer(cmdbuffer->get(), buffer->buffer(), mHostBuffer->buffer(),
+                            1, &bufferCopy);
+            cmdbuffer->end();
+            pushCommand(cmdbuffer->get());
+            _finish();
+        }
         _copyBufferToTensor(dstTensor, mHostBuffer.get(), 0, dstTensor->getType().code == halide_type_float && mUseFP16);
     } else if (srcTensor->deviceId() != 0 && dstTensor->deviceId() != 0) {
         // gpu->gpu

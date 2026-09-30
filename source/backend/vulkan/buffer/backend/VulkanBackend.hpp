@@ -141,6 +141,12 @@ public:
 private:
     void _finish() const;
     void _requireHostBuffer(size_t size) const;
+    // Copy between a device buffer and user host memory by importing the host
+    // range (VK_EXT_external_memory_host) -- one DMA, no staging buffer or
+    // memcpy. Returns false when unsupported / not worthwhile / on any failure;
+    // the caller then uses the staging path.
+    bool _copyWithHostImport(VkBuffer deviceBuffer, VkDeviceSize deviceOffset, void* host, size_t size,
+                             bool deviceToHost) const;
     void _resetIndirectSegments();
     void _sealIndirectSegment();
     mutable std::shared_ptr<VulkanBuffer> mHostBuffer;

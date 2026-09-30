@@ -10,6 +10,7 @@
 #define VulkanDevice_hpp
 
 #include <memory>
+#include <mutex>
 #include <vector>
 #include "core/NonCopyable.hpp"
 #include "backend/vulkan/component/VulkanInstance.hpp"
@@ -196,6 +197,42 @@ public:
     bool getInt8Support() const {
         return mInt8Info.supportInt8;
     }
+
+    // VK_EXT_external_memory_host: host allocations can be imported as
+    // VkDeviceMemory, so copies to / from user memory need no staging buffer.
+    bool supportHostImport() const {
+        return nullptr != mGetMemoryHostPointerProperties;
+    }
+    VkDeviceSize hostImportAlignment() const {
+        return mHostImportAlignment;
+    }
+    // Dedicated transfer queue: a family with TRANSFER but neither GRAPHICS nor
+    // COMPUTE, i.e. the DMA copy engines on NVIDIA. Host<->device copies on
+    // the default graphics/compute queue reach ~5.7 GB/s on an RTX 5090 vs
+    // ~28 GB/s here. Buffers created with VK_SHARING_MODE_CONCURRENT are shared
+    // between the two families (createBuffer falls back to EXCLUSIVE without one).
+    bool hasTransferQueue() const {
+        return VK_NULL_HANDLE != mTransferQueue;
+    }
+    // Copy one region on the transfer queue and wait for completion. Returns
+    // false when there is no transfer queue or the submission failed.
+    bool transferCopy(VkBuffer src, VkBuffer dst, const VkBufferCopy& region, bool dstIsHost) const;
+
+    VkResult getMemoryHostPointerProperties(const void* ptr, VkMemoryHostPointerPropertiesEXT* props) const {
+        return mGetMemoryHostPointerProperties(mDevice, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr,
+                                               props);
+    }
+
+private:
+    void createTransferQueue();
+    uint32_t mTransferFamily = UINT32_MAX;
+    VkQueue mTransferQueue = VK_NULL_HANDLE;
+    VkCommandPool mTransferPool = VK_NULL_HANDLE;
+    VkCommandBuffer mTransferCmd = VK_NULL_HANDLE;
+    VkFence mTransferFence = VK_NULL_HANDLE;
+    mutable std::mutex mTransferMutex;
+    PFN_vkGetMemoryHostPointerPropertiesEXT mGetMemoryHostPointerProperties = nullptr;
+    VkDeviceSize mHostImportAlignment = 0;
 
 private:
     // Set mFP16Info
