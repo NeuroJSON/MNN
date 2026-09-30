@@ -139,3 +139,110 @@ __kernel void layernorm_buf(__private int global_dim0, __private int global_dim1
 
 #endif
 }
+
+/*
+ * Split-row LayerNorm for few, very long rows (e.g. InstanceNorm on a 3D
+ * volume reshaped to (1, C, D*H*W): 32 rows of 4.7M values). layernorm_buf runs
+ * one work-group per row, which leaves most of a large GPU idle. Here:
+ *   layernorm_split_stats    one work-group per (row, chunk): chunk count, mean
+ *                            and M2 (sum of squared deviations from the chunk mean)
+ *   layernorm_split_finalize one work-item per row: merge the chunks (Chan et al.)
+ *                            into mean and 1/sqrt(var + eps)
+ *   layernorm_split_norm     one work-item per float4 of the output
+ * Requires inside % 4 == 0 (rows start on a float4 boundary).
+ */
+#ifndef SPLIT_LOCAL
+#define SPLIT_LOCAL 256
+#endif
+
+__kernel void layernorm_split_stats(__global const FLOAT4* restrict input,
+                                    __global float* restrict stats,
+                                    __private const int inside4,
+                                    __private const int chunk4,
+                                    __private const int chunks) {
+    __local float red[SPLIT_LOCAL];
+    const int lid   = get_local_id(0);
+    const int chunk = get_group_id(0);
+    const int row   = get_global_id(1);
+    const int begin = chunk * chunk4;
+    const int end   = min(begin + chunk4, inside4);
+    __global const FLOAT4* p = input + (size_t)row * inside4;
+    const float n = (float)((end - begin) * 4);
+#ifdef RMSNORM
+    const float mean = 0.0f;
+#else
+    float4 s = (float4)0;
+    for (int i = begin + lid; i < end; i += SPLIT_LOCAL) {
+        s += convert_float4(p[i]);
+    }
+    red[lid] = s.x + s.y + s.z + s.w;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = SPLIT_LOCAL / 2; k > 0; k >>= 1) {
+        if (lid < k) red[lid] += red[lid + k];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float mean = red[0] / n;
+    barrier(CLK_LOCAL_MEM_FENCE);
+#endif
+    float4 q = (float4)0;
+    for (int i = begin + lid; i < end; i += SPLIT_LOCAL) {
+        const float4 d = convert_float4(p[i]) - (float4)mean;
+        q += d * d;
+    }
+    red[lid] = q.x + q.y + q.z + q.w;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = SPLIT_LOCAL / 2; k > 0; k >>= 1) {
+        if (lid < k) red[lid] += red[lid + k];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        __global float* o = stats + ((size_t)row * chunks + chunk) * 3;
+        o[0] = n;
+        o[1] = mean;
+        o[2] = red[0];
+    }
+}
+
+__kernel void layernorm_split_finalize(__global const float* restrict stats,
+                                       __global float* restrict rowstat,
+                                       __private const int chunks,
+                                       __private const int rows,
+                                       __private const float epsilon) {
+    const int row = get_global_id(0);
+    if (row >= rows) return;
+    __global const float* s = stats + (size_t)row * chunks * 3;
+    float n = 0.0f, mean = 0.0f, m2 = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        const float nb = s[c * 3], mb = s[c * 3 + 1], m2b = s[c * 3 + 2];
+        const float tot = n + nb;
+        const float delta = mb - mean;
+        mean += delta * (nb / tot);
+        m2 += m2b + delta * delta * (n * nb / tot);
+        n = tot;
+    }
+    rowstat[row * 2]     = mean;
+    rowstat[row * 2 + 1] = 1.0f / sqrt(m2 / n + epsilon);
+}
+
+__kernel void layernorm_split_norm(__private const int global_dim0,
+                                   __private const int global_dim1,
+                                   __global const FLOAT4* restrict input,
+                                   __global FLOAT4* restrict output,
+                                   __global const float* restrict rowstat,
+#ifdef GAMMA_BETA
+                                   __global const FLOAT4* restrict gamma,
+                                   __global const FLOAT4* restrict beta,
+#endif
+                                   __private const int inside4) {
+    const int x = get_global_id(0);
+    const int row = get_global_id(1);
+    if (x >= global_dim0 || row >= global_dim1) return;
+    const float mean = rowstat[row * 2];
+    const float r = rowstat[row * 2 + 1];
+    const size_t i = (size_t)row * inside4 + x;
+    float4 v = (convert_float4(input[i]) - (float4)mean) * (float4)r;
+#ifdef GAMMA_BETA
+    v = v * convert_float4(gamma[x]) + convert_float4(beta[x]);
+#endif
+    output[i] = CONVERT_FLOAT4(v);
+}

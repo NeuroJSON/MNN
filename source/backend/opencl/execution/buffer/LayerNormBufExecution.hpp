@@ -39,6 +39,12 @@ public:
 
 private:
     int getLocalSize(int size, int maxGroupSize);
+    // Split-row path (layernorm_split_*) for few, very long rows.
+    ErrorCode encodeSplit(Tensor* input, Tensor* output, int outter_size, int inner_size);
+    std::shared_ptr<cl::Buffer> mSplitStats;  // per (row, chunk): n, mean, M2
+    std::shared_ptr<cl::Buffer> mSplitRow;    // per row: mean, 1/sqrt(var + eps)
+    size_t mSplitStatsBytes = 0;
+    size_t mSplitRowBytes   = 0;
     std::vector<uint32_t> mLWS{0, 0, 0, 0};
     std::vector<uint32_t> mGWS{0, 0, 0, 0};
     OpenCLBackend *mOpenCLBackend;

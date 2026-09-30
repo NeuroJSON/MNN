@@ -8,6 +8,7 @@
 
 #ifndef MNN_OPENCL_BUFFER_CLOSED
 #include "backend/opencl/execution/buffer/LayerNormBufExecution.hpp"
+#include <cstdlib>
 
 namespace MNN {
 namespace OpenCL {
@@ -159,6 +160,19 @@ ErrorCode LayerNormBufExecution::onEncode(const std::vector<Tensor *> &inputs, c
         inner_size /= mResource->group_;
     }
     
+    // One work-group per row leaves a large GPU mostly idle when there are few,
+    // very long rows (InstanceNorm on a 3D volume: 32 rows of 4.7M values at
+    // SIAM's full resolution). Split those rows across work-groups instead.
+    // MNN_LAYERNORM_NOSPLIT=1 keeps the single-kernel path.
+    static int s_nosplit = -1;
+    if (s_nosplit < 0) {
+        const char* e = std::getenv("MNN_LAYERNORM_NOSPLIT");
+        s_nosplit = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (s_nosplit == 0 && inner_size % 4 == 0 && inner_size >= 65536) {
+        return encodeSplit(input, output, outter_size, inner_size);
+    }
+
     int local_size = getLocalSize(inner_size / 4, MaxLocalSize);
     std::set<std::string> buildOptions;
     buildOptions.emplace("-DLOCAL_SIZE=" + std::to_string(local_size));
@@ -195,6 +209,94 @@ ErrorCode LayerNormBufExecution::onEncode(const std::vector<Tensor *> &inputs, c
 
     return NO_ERROR;
 
+}
+
+ErrorCode LayerNormBufExecution::encodeSplit(Tensor* input, Tensor* output, int outter_size, int inner_size) {
+    auto runtime = mOpenCLBackend->getOpenCLRuntime();
+    const int kLocal  = 256;              // SPLIT_LOCAL: power of two
+    const int inside4 = inner_size / 4;
+    const int chunk4  = kLocal * 8;       // float4s per work-group (8 per work-item)
+    const int chunks  = UP_DIV(inside4, chunk4);
+
+    const size_t statsBytes = static_cast<size_t>(outter_size) * chunks * 3 * sizeof(float);
+    const size_t rowBytes   = static_cast<size_t>(outter_size) * 2 * sizeof(float);
+    if (nullptr == mSplitStats || mSplitStatsBytes < statsBytes) {
+        mSplitStats.reset(new cl::Buffer(runtime->context(), CL_MEM_READ_WRITE, statsBytes));
+        mSplitStatsBytes = statsBytes;
+    }
+    if (nullptr == mSplitRow || mSplitRowBytes < rowBytes) {
+        mSplitRow.reset(new cl::Buffer(runtime->context(), CL_MEM_READ_WRITE, rowBytes));
+        mSplitRowBytes = rowBytes;
+    }
+
+    std::set<std::string> options = {"-DSPLIT_LOCAL=" + std::to_string(kLocal)};
+    if (mResource->RMSNorm) {
+        options.emplace("-DRMSNORM");
+    }
+    if (mResource->has_gamma_beta_) {
+        options.emplace("-DGAMMA_BETA");
+    }
+    mUnits.resize(3);
+    cl_int ret = CL_SUCCESS;
+
+    auto& stats = mUnits[0];
+    stats.kernel = runtime->buildKernel("layernorm_buf", "layernorm_split_stats", options, mOpenCLBackend->getPrecision());
+    if (nullptr == stats.kernel) {
+        return NOT_SUPPORT;
+    }
+    uint32_t idx = 0;
+    ret |= stats.kernel->get().setArg(idx++, openCLBuffer(input));
+    ret |= stats.kernel->get().setArg(idx++, *mSplitStats);
+    ret |= stats.kernel->get().setArg(idx++, inside4);
+    ret |= stats.kernel->get().setArg(idx++, chunk4);
+    ret |= stats.kernel->get().setArg(idx++, chunks);
+    std::vector<uint32_t> gws0 = {static_cast<uint32_t>(kLocal * chunks), static_cast<uint32_t>(outter_size)};
+    std::vector<uint32_t> lws0 = {static_cast<uint32_t>(kLocal), 1};
+    mOpenCLBackend->recordKernel2d(stats.kernel, gws0, lws0);
+    stats.globalWorkSize = {gws0[0], gws0[1]};
+    stats.localWorkSize  = {lws0[0], lws0[1]};
+
+    auto& fin = mUnits[1];
+    fin.kernel = runtime->buildKernel("layernorm_buf", "layernorm_split_finalize", options, mOpenCLBackend->getPrecision());
+    if (nullptr == fin.kernel) {
+        return NOT_SUPPORT;
+    }
+    idx = 0;
+    ret |= fin.kernel->get().setArg(idx++, *mSplitStats);
+    ret |= fin.kernel->get().setArg(idx++, *mSplitRow);
+    ret |= fin.kernel->get().setArg(idx++, chunks);
+    ret |= fin.kernel->get().setArg(idx++, outter_size);
+    ret |= fin.kernel->get().setArg(idx++, mResource->epsilon_);
+    std::vector<uint32_t> gws1 = {static_cast<uint32_t>(ROUND_UP(outter_size, 64)), 1};
+    std::vector<uint32_t> lws1 = {64, 1};
+    mOpenCLBackend->recordKernel2d(fin.kernel, gws1, lws1);
+    fin.globalWorkSize = {gws1[0], gws1[1]};
+    fin.localWorkSize  = {lws1[0], lws1[1]};
+
+    auto& norm = mUnits[2];
+    norm.kernel = runtime->buildKernel("layernorm_buf", "layernorm_split_norm", options, mOpenCLBackend->getPrecision());
+    if (nullptr == norm.kernel) {
+        return NOT_SUPPORT;
+    }
+    const uint32_t g0 = static_cast<uint32_t>(inside4), g1 = static_cast<uint32_t>(outter_size);
+    idx = 0;
+    ret |= norm.kernel->get().setArg(idx++, g0);
+    ret |= norm.kernel->get().setArg(idx++, g1);
+    ret |= norm.kernel->get().setArg(idx++, openCLBuffer(input));
+    ret |= norm.kernel->get().setArg(idx++, openCLBuffer(output));
+    ret |= norm.kernel->get().setArg(idx++, *mSplitRow);
+    if (mResource->has_gamma_beta_) {
+        ret |= norm.kernel->get().setArg(idx++, *mResource->mGammaBuffer.get());
+        ret |= norm.kernel->get().setArg(idx++, *mResource->mBetaBuffer.get());
+    }
+    ret |= norm.kernel->get().setArg(idx++, inside4);
+    MNN_CHECK_CL_SUCCESS(ret, "setArg LayerNormBufExecution split");
+    std::vector<uint32_t> gws2 = {g0, g1};
+    std::vector<uint32_t> lws2 = {256, 1};
+    mOpenCLBackend->recordKernel2d(norm.kernel, gws2, lws2);
+    norm.globalWorkSize = {gws2[0], gws2[1]};
+    norm.localWorkSize  = {lws2[0], lws2[1]};
+    return NO_ERROR;
 }
 
 class LayerNormBufCreator : public OpenCLBackend::Creator {
