@@ -7,6 +7,7 @@
 //
 
 #include "backend/vulkan/component/VulkanDevice.hpp"
+#include <cstdlib>
 #include <string.h>
 #include <algorithm>
 //#define MNN_VULKAN_PRINT_EXT
@@ -73,6 +74,18 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance)
     CALL_VK(mInstance->enumeratePhysicalDevices(gpuCount, tmpGpus.data()));
     MNN_ASSERT(nullptr != tmpGpus[0]);
     mPhysicalDevice = tmpGpus[0];
+    // MNN_VULKAN_DEVICE=<n> selects the n-th physical device (vkEnumeratePhysicalDevices
+    // order, as listed by `vulkaninfo --summary`). BackendConfig::sharedContext cannot
+    // be used for this: the Vulkan runtime reads it as a full MNNVulkanContext.
+    const char* devEnv = ::getenv("MNN_VULKAN_DEVICE");
+    if (nullptr != devEnv && devEnv[0] != '\0') {
+        const int want = ::atoi(devEnv);
+        if (want >= 0 && want < (int)gpuCount) {
+            mPhysicalDevice = tmpGpus[want];
+        } else {
+            MNN_ERROR("MNN_VULKAN_DEVICE=%d out of range (%u devices), using device 0\n", want, gpuCount);
+        }
+    }
 
     // Set queue.
     uint32_t queueFamilyCount = 1;
