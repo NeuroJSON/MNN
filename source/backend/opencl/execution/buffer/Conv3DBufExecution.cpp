@@ -209,6 +209,18 @@ Conv3DBufExecution::Conv3DBufExecution(const std::vector<Tensor*>& inputs,
     OPENCL_CHECK_KERNEL_CTOR(mKernelNCHW);
     mMaxWGS_NCHW = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernelNCHW));
 
+    const int optTile[3][2] = {{4, 2}, {2, 2}, {1, 1}};
+    for (int i = 0; i < 3; ++i) {
+        std::set<std::string> optOptions = {"-DTW=" + std::to_string(optTile[i][0]),
+                                            "-DTH=" + std::to_string(optTile[i][1]), "-DTOC=1"};
+        mOpt[i].kernel = runtime->buildKernel("conv_3d_buf", "conv_3d_buf_opt", optOptions,
+                                              mOpenCLBackend->getPrecision());
+        OPENCL_CHECK_KERNEL_CTOR(mOpt[i].kernel);
+        mOpt[i].tw     = optTile[i][0];
+        mOpt[i].th     = optTile[i][1];
+        mOpt[i].maxWGS = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mOpt[i].kernel));
+    }
+
     /* unit.kernel will be assigned per-encode. */
     unit.kernel = mKernelNC4;  /* default; onEncode may swap */
     mMaxWorkGroupSize = mMaxWGS_NC4;
@@ -280,6 +292,51 @@ ErrorCode Conv3DBufExecution::onEncode(const std::vector<Tensor*>& inputs,
         s_notile = (e && e[0] == '1') ? 1 : 0;
     }
     const bool can_tile = !use_nchw_kernel && (Wout >= 2) && (s_notile == 0);
+
+    /* conv_3d_buf_opt is the default NC4HW4 path; MNN_CONV3D_LEGACY=1 keeps
+     * the original nc4dhw4 / t22 kernels for A/B comparison. */
+    static int s_legacy = -1;
+    if (s_legacy < 0) {
+        const char* e = std::getenv("MNN_CONV3D_LEGACY");
+        s_legacy = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (!use_nchw_kernel && s_legacy == 0) {
+        /* Tile and work-group size from a sweep of every SIAM v0.3 shape on
+         * an RTX 5090 (tools/mnn_probe clbench): 4x2 tiles reach ~43 TFLOP/s
+         * on >= 48x48x32 outputs; below ~8k voxels the tiled kernels leave
+         * too few work-items, so the deep 320-channel layers run untiled. */
+        const long vox = static_cast<long>(Dout) * Hout * Wout;
+        const int sel = (vox >= 65536) ? 0 : ((vox >= 8192) ? 1 : 2);
+        static const uint32_t lwsTab[3][3] = {{16, 1, 8}, {8, 2, 8}, {8, 4, 4}};
+        const OptKernel& ok = mOpt[sel];
+        unit.kernel = ok.kernel;
+        mGWS[0] = static_cast<uint32_t>(UP_DIV(Wout, ok.tw));
+        mGWS[1] = static_cast<uint32_t>(Dout * UP_DIV(Hout, ok.th));
+        mGWS[2] = static_cast<uint32_t>(Coutblk);
+        mLWS = {lwsTab[sel][0], lwsTab[sel][1], lwsTab[sel][2]};
+        while (mLWS[0] * mLWS[1] * mLWS[2] > ok.maxWGS && mLWS[2] > 1) {
+            mLWS[2] /= 2;
+        }
+        uint32_t idx = 0;
+        cl_int ret = CL_SUCCESS;
+        ret |= unit.kernel->get().setArg(idx++, mGWS[0]);
+        ret |= unit.kernel->get().setArg(idx++, mGWS[1]);
+        ret |= unit.kernel->get().setArg(idx++, mGWS[2]);
+        ret |= unit.kernel->get().setArg(idx++, openCLBuffer(in));
+        ret |= unit.kernel->get().setArg(idx++, *mKernelBuffer);
+        ret |= unit.kernel->get().setArg(idx++, *mBiasBuffer);
+        ret |= unit.kernel->get().setArg(idx++, openCLBuffer(out));
+        const int iargs[] = {Cinblk, Din, Hin, Win, Dout, Hout, Wout, mKernelD, mKernelH, mKernelW,
+                             mStrideD, mStrideH, mStrideW, mPadD, mPadH, mPadW};
+        for (int v : iargs) {
+            ret |= unit.kernel->get().setArg(idx++, v);
+        }
+        MNN_CHECK_CL_SUCCESS(ret, "setArg Conv3DBufExecution opt");
+        mOpenCLBackend->recordKernel3d(unit.kernel, mGWS, mLWS);
+        unit.globalWorkSize = {mGWS[0], mGWS[1], mGWS[2]};
+        unit.localWorkSize  = {mLWS[0], mLWS[1], mLWS[2]};
+        return NO_ERROR;
+    }
 
     if (use_nchw_kernel) {
         unit.kernel = mKernelNCHW;

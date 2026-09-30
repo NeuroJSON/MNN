@@ -451,3 +451,148 @@ __kernel void conv_3d_buf_nchw_in(GLOBAL_SIZE_3_DIMS
     const int out_voxel = ((oc_blk * out_d + od) * out_h + oh) * out_w + ox;
     vstore4(CONVERT_FLOAT4(acc), out_voxel, output);
 }
+
+/*
+ * conv_3d_buf_opt
+ *
+ * Register-blocked variant of conv_3d_buf_nc4dhw4 (same argument list, same
+ * NC4DHW4 / packed-weight layouts). Compile-time tile: TW output voxels along
+ * W (interleaved: ow = wt + j * gs0, so each j is a coalesced warp-wide load),
+ * TH along H, TOC output-channel blocks; global size
+ * (ceil(Wout/TW), Dout*ceil(Hout/TH), ceil(Cout4/TOC)), TOC must divide Cout4.
+ *
+ * The buffers are typed FLOAT4 + restrict. With FLOAT* + vload4 (the kernels
+ * above) NVIDIA's compiler can only assume 4-byte alignment and splits every
+ * vector load into four 32-bit loads, which makes the inner loop load-issue
+ * bound (RTX 5090: ~18 TFLOP/s -> ~43 TFLOP/s with TW=4, TH=2).
+ */
+#ifndef TW
+#define TW 2
+#endif
+#ifndef TH
+#define TH 1
+#endif
+#ifndef TOC
+#define TOC 4
+#endif
+
+__kernel void conv_3d_buf_opt(__private const int global_size_dim0,
+                              __private const int global_size_dim1,
+                              __private const int global_size_dim2,
+                              __global const FLOAT4* restrict input,
+                              __global const FLOAT4* restrict weight,
+                              __global const FLOAT4* restrict bias,
+                              __global FLOAT4* restrict output,
+                              __private const int in_cblock,
+                              __private const int in_d,
+                              __private const int in_h,
+                              __private const int in_w,
+                              __private const int out_d,
+                              __private const int out_h,
+                              __private const int out_w,
+                              __private const int kd,
+                              __private const int kh,
+                              __private const int kw,
+                              __private const int sd,
+                              __private const int sh,
+                              __private const int sw,
+                              __private const int pd,
+                              __private const int ph,
+                              __private const int pw) {
+    const int wt  = get_global_id(0);
+    const int gdh = get_global_id(1);
+    const int oct = get_global_id(2);
+    if (wt >= global_size_dim0 || gdh >= global_size_dim1 || oct >= global_size_dim2) {
+        return;
+    }
+    const int h_tiles = (out_h + TH - 1) / TH;
+    const int ht = gdh % h_tiles;
+    const int od = gdh / h_tiles;
+    const int oh0 = ht * TH;
+    const int ocb0 = oct * TOC;
+    const int kvol = kd * kh * kw;
+    const int in_hw = in_h * in_w;
+    const int in_dhw = in_d * in_hw;
+    /* number of valid output-channel blocks = weight rows; bias buffer holds exactly that */
+    COMPUTE_FLOAT4 acc[TOC][TH][TW];
+    #pragma unroll
+    for (int o = 0; o < TOC; ++o) {
+        COMPUTE_FLOAT4 b = CONVERT_COMPUTE_FLOAT4(bias[ocb0 + o]);   /* host pads Cout4 to a multiple of TOC */
+        #pragma unroll
+        for (int i = 0; i < TH; ++i)
+            #pragma unroll
+            for (int j = 0; j < TW; ++j) acc[o][i][j] = b;
+    }
+    const int id0 = od * sd - pd;
+    for (int kdi = 0; kdi < kd; ++kdi) {
+        const int iz = id0 + kdi;
+        if (iz < 0 || iz >= in_d) continue;
+        for (int khi = 0; khi < kh; ++khi) {
+            int iy[TH];
+            bool vy[TH];
+            #pragma unroll
+            for (int i = 0; i < TH; ++i) {
+                iy[i] = (oh0 + i) * sh - ph + khi;
+                vy[i] = (oh0 + i < out_h) && iy[i] >= 0 && iy[i] < in_h;
+            }
+            for (int kwi = 0; kwi < kw; ++kwi) {
+                int ix[TW];
+                bool vx[TW];
+                #pragma unroll
+                for (int j = 0; j < TW; ++j) {
+                    const int ow = wt + j * global_size_dim0;
+                    ix[j] = ow * sw - pw + kwi;
+                    vx[j] = (ow < out_w) && ix[j] >= 0 && ix[j] < in_w;
+                }
+                const int kpos = (kdi * kh + khi) * kw + kwi;
+                __global const FLOAT4* wp = weight + ((size_t)ocb0 * kvol + kpos) * in_cblock * 4;
+                const size_t wstride = (size_t)kvol * in_cblock * 4;   /* next oc block */
+                __global const FLOAT4* ip = input + iz * in_hw;
+                for (int icb = 0; icb < in_cblock; ++icb) {
+                    COMPUTE_FLOAT4 w[TOC][4];
+                    #pragma unroll
+                    for (int o = 0; o < TOC; ++o) {
+                        w[o][0] = CONVERT_COMPUTE_FLOAT4(wp[o * wstride + 0]);
+                        w[o][1] = CONVERT_COMPUTE_FLOAT4(wp[o * wstride + 1]);
+                        w[o][2] = CONVERT_COMPUTE_FLOAT4(wp[o * wstride + 2]);
+                        w[o][3] = CONVERT_COMPUTE_FLOAT4(wp[o * wstride + 3]);
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < TH; ++i) {
+                        if (!vy[i]) continue;
+                        #pragma unroll
+                        for (int j = 0; j < TW; ++j) {
+                            if (!vx[j]) continue;
+                            const COMPUTE_FLOAT4 v = CONVERT_COMPUTE_FLOAT4(ip[iy[i] * in_w + ix[j]]);
+                            #pragma unroll
+                            for (int o = 0; o < TOC; ++o) {
+                                acc[o][i][j] = mad((COMPUTE_FLOAT4)(v.x), w[o][0], acc[o][i][j]);
+                                acc[o][i][j] = mad((COMPUTE_FLOAT4)(v.y), w[o][1], acc[o][i][j]);
+                                acc[o][i][j] = mad((COMPUTE_FLOAT4)(v.z), w[o][2], acc[o][i][j]);
+                                acc[o][i][j] = mad((COMPUTE_FLOAT4)(v.w), w[o][3], acc[o][i][j]);
+                            }
+                        }
+                    }
+                    wp += 4;
+                    ip += in_dhw;
+                }
+            }
+        }
+    }
+    const int out_hw = out_h * out_w;
+    const int out_dhw = out_d * out_hw;
+    #pragma unroll
+    for (int o = 0; o < TOC; ++o) {
+        __global FLOAT4* op = output + (size_t)(ocb0 + o) * out_dhw + od * out_hw;
+        #pragma unroll
+        for (int i = 0; i < TH; ++i) {
+            const int oh = oh0 + i;
+            if (oh >= out_h) break;
+            #pragma unroll
+            for (int j = 0; j < TW; ++j) {
+                const int ow = wt + j * global_size_dim0;
+                if (ow < out_w) op[oh * out_w + ow] = CONVERT_FLOAT4(acc[o][i][j]);
+            }
+        }
+    }
+}

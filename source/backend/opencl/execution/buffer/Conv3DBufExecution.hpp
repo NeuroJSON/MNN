@@ -79,6 +79,16 @@ private:
     uint32_t mMaxWGS_NC4    = 1;
     uint32_t mMaxWGS_NC4T22 = 1;
     uint32_t mMaxWGS_NCHW   = 1;
+    // conv_3d_buf_opt (FLOAT4-typed, register-blocked) at three TW x TH tiles,
+    // picked per output size in onEncode: large volumes {4,2}, mid {2,2},
+    // small / deep layers {1,1} (more work-items).
+    struct OptKernel {
+        std::shared_ptr<KernelWrap> kernel;
+        int tw = 1;
+        int th = 1;
+        uint32_t maxWGS = 1;
+    };
+    OptKernel mOpt[3];
 
     // Per-launch global / local work sizes resolved in onEncode().
     std::vector<uint32_t> mGWS{1, 1, 1};
