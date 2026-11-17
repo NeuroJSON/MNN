@@ -26,9 +26,20 @@ extern const std::map<std::string, const char*> OpenCLProgramMap;
 static std::mutex gCLMutex;
 static std::weak_ptr<::cl::Context> globalContext;
 static std::mutex gCLContextMutex;
-static std::shared_ptr<::cl::Context> getGlobalContext(){
-    return globalContext.lock();
+// The shared context is reused only by runtimes on the same device: a context
+// holds one device here, so a queue for another GPU on it fails with
+// CL_INVALID_DEVICE (-33) and the session silently falls back to the CPU.
+static std::shared_ptr<::cl::Context> getGlobalContext(const cl::Device& device){
+    std::lock_guard<std::mutex> lck(gCLContextMutex);
+    auto ctx = globalContext.lock();
+    if (ctx != nullptr) {
+        auto devices = ctx->getInfo<CL_CONTEXT_DEVICES>();
+        if (devices.size() != 1 || devices[0]() != device()) {
+            return nullptr;
         }
+    }
+    return ctx;
+}
 
 static void setGlobalContext(std::shared_ptr<cl::Context> Context){
     std::lock_guard<std::mutex> lck(gCLContextMutex);
@@ -212,7 +223,7 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                     // Do nothing
                 });
             }else{
-                mContext = getGlobalContext();
+                mContext = getGlobalContext(*mFirstGPUDevicePtr);
                 if(mContext == nullptr){
                     if(context_properties.size() > 0){
                         context_properties.push_back(0);
